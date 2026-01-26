@@ -11,5 +11,6 @@ headless_chrome = "1.0.20"
 image = "0.25.9"
 ocrs = "0.12.0"
 reqwest = { version = "0.12.12", features = ["json", "cookies"] }
+serde_json = "1.0.149"
 tokio = "1.49.0"
 xcap = "0.8.1"

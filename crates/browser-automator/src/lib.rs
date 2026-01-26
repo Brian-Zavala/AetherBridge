@@ -1,3 +1,4 @@
+pub mod google_driver;
 pub mod protocol_driver;
 pub mod visual_driver;
 

@@ -448,6 +448,7 @@ dependencies = [
  "image",
  "ocrs",
  "reqwest",
+ "serde_json",
  "tokio",
  "xcap",
 ]
