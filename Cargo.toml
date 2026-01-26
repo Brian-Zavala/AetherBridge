@@ -2,6 +2,7 @@
 members = [
     "crates/api-server",
     "crates/browser-automator",
-    "crates/common"
+    "crates/common",
+    "crates/tui"
 ]
 resolver = "2"

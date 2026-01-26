@@ -1,0 +1,30 @@
+[package]
+name = "aether-tui"
+version = "0.1.0"
+edition = "2024"
+description = "Interactive TUI for AetherBridge"
+
+[[bin]]
+name = "aether"
+path = "src/main.rs"
+
+[dependencies]
+# TUI Framework
+ratatui = "0.30"
+crossterm = "0.29"
+
+# Async runtime
+tokio = { version = "1.49", features = ["full", "sync"] }
+tokio-util = "0.7"
+
+# Workspace crates
+common = { version = "0.1.0", path = "../common" }
+browser-automator = { version = "0.1.0", path = "../browser-automator" }
+
+# Error handling and logging
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Utilities
+chrono = "0.4"

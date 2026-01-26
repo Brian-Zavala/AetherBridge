@@ -1,71 +1,59 @@
-# AetherBridge
+# AetherBridge 🌉
 
-**AetherBridge** is a Rust-native Local AI Orchestration Platform that bridges your existing web AI subscriptions (like Google Antigravity/Project IDX) to API-compatible endpoints.
+**Unlock the power of your existing AI subscriptions.**
 
-This allows you to use powerful developer tools that require an OpenAI-compatible API (like `Claude Code`, `OpenCode`, or `Gemini CLI`) using the flat-rate subscriptions you already pay for, without incurring per-token API costs.
+AetherBridge turns your active browser sessions (like Google Antigravity/Project IDX) into local, OpenAI-compatible API endpoints. Use powerful development tools like `Claude Code`, `OpenCode`, or `Kuse Cowork` with the flat-rate subscriptions you already pay for—no per-token costs.
 
-## Architecture
+---
 
-AetherBridge operates as a local proxy server:
+## ✨ Features
 
-1.  **API Server**: Listens on `http://localhost:8080/v1` and accepts standard OpenAI Chat Completion requests.
-2.  **Browser Automator**: Handles the interaction with the upstream Web AI providers.
-    *   **Strategy A (Protocol)**: Extracts cookies from your local browser and impersonates web requests (high speed).
-    *   **Strategy B (Visual)**: (Fallback) Captures screen content and uses OCR/Input simulation to drive the web UI directly.
+- **Interactive TUI**: Beautiful terminal interface for easy management
+- **Cross-Platform**: Seamless support for Windows, macOS, and Linux
+- **Auto-Magic**: Automatically detects browser profiles (Chrome, Brave, Edge, Chromium)
+- **Zero Config**: Works out-of-the-box with sensible defaults
+- **Universal Compatibility**: Exposes standard `/v1/chat/completions` API
 
-## Prerequisites
+---
 
-*   Rust (latest stable)
-*   Google Chrome / Chromium (for cookie extraction)
-*   Linux (tested), macOS/Windows (experimental)
+## 🚀 Quick Start
 
-## Installation
+### 1. Prerequisites
+- **Rust** (latest stable 1.85+)
+- A Chromium-based browser (Chrome, Brave, Edge, Chromium) logged into your AI provider (e.g., `ide.google.com`)
 
+### 2. Install & Run
 ```bash
 git clone https://github.com/Brian-Zavala/AetherBridge.git
 cd AetherBridge
-cargo build --release
+cargo run -p aether-tui
 ```
 
-## Usage
+### 3. Using the TUI
+Once running, you'll see the interactive dashboard. Use these keys:
 
-### 1. Configuration (Optional)
+| Key | Action |
+|-----|--------|
+| **[S]** | **Start/Stop** the bridge server |
+| **[C]** | **Copy** the local server URL to clipboard |
+| **[P]** | **Port** configuration (default: 8080) |
+| **[R]** | **Refresh** browser detection |
+| **[H]** | **Help** overlay with full keybindings |
+| **[Q]** | **Quit** application |
 
-By default, AetherBridge looks for Google cookies in your default Chrome profile. You can customize this by editing `config.toml` (if implemented) or modifying `crates/common/src/config.rs`.
+---
 
-### 2. Running the Bridge
+## 🛠️ Integration Examples
 
-```bash
-./target/release/api-server
-```
-
-The server will start at `http://localhost:8080`.
-
-**Options:**
-- `--port <PORT>`: Bind to a specific port (default: 8080).
-- `--browser-profile <PATH>`: Path to your browser profile for cookie extraction.
-
-Example:
-```bash
-./target/release/api-server --port 9090 --browser-profile "/home/user/.config/google-chrome/Default"
-```
-
-### 3. Tool Integration
-
-#### Claude Code
-
-Configure Claude Code to use AetherBridge as a custom OpenAI provider:
-
+### connect with Claude Code
 ```bash
 export OPENAI_BASE_URL="http://localhost:8080/v1"
-export OPENAI_API_KEY="dummy-key" # AetherBridge ignores the key
+export OPENAI_API_KEY="dummy"
 claude
 ```
 
-#### OpenCode / Editor Extensions
-
-For VS Code extensions like **Continue** or **OpenCode**, add a custom model configuration:
-
+### VS Code Extensions (Continue/OpenCode)
+Add this to your `config.json`:
 ```json
 {
   "title": "AetherBridge (Google)",
@@ -76,22 +64,49 @@ For VS Code extensions like **Continue** or **OpenCode**, add a custom model con
 }
 ```
 
-#### Gemini CLI
+---
 
-If using a CLI wrapper that supports custom endpoints:
+## 🌍 Platform Specifics
+
+### Linux 🐧
+- **Clipboard Support**: Ensure you have `xclip`, `xsel`, or `wl-clipboard` installed.
+- **Paths**: Auto-detects `~/.config/google-chrome`, `~/.config/chromium`, etc.
+
+### Windows 🪟
+- **Important**: Close your browser completely before starting AetherBridge (browsers lock cookie files).
+- **Run as Admin**: May be required depending on your installation path.
+- **Paths**: Auto-detects `%LOCALAPPDATA%` profiles.
+
+### macOS 🍎
+- **Permissions**: You may need to grant Terminal "Full Disk Access" to read browser cookies.
+- **Paths**: Auto-detects `~/Library/Application Support/` profiles.
+
+---
+
+## ❓ Troubleshooting
+
+**"Error sending request for url"**
+> Your session cookies might be expired.
+> 1. Close AetherBridge.
+> 2. Open your browser and refresh `ide.google.com` to ensure you're logged in.
+> 3. Close the browser completely.
+> 4. Restart AetherBridge.
+
+**"No browser profile detected"**
+> Press **[R]** to refresh detection. If it persists, ensure you have launched your browser at least once and logged in.
+
+---
+
+## 💻 Development
 
 ```bash
-gemini --base-url http://localhost:8080/v1 --key dummy "Hello world"
+# Run the TUI
+cargo run -p aether-tui
+
+# Run the CLI/Server directly
+cargo run -p api-server -- serve
 ```
 
-## Troubleshooting
+---
 
-### "Error: error sending request for url"
-This usually means AetherBridge could not find valid session cookies for the provider.
-1.  Open Chrome/Chromium.
-2.  Log in to `https://ide.google.com` (or the target provider).
-3.  Ensure your `browser_profile_path` in `crates/common` matches your actual profile location (e.g., `~/.config/google-chrome/Default`).
-4.  Restart AetherBridge.
-
-## License
-MIT
+*Built with Rust 🦀 - [License: MIT](./LICENSE)*
