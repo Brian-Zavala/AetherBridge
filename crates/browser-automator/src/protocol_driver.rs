@@ -5,23 +5,18 @@ use std::sync::Arc;
 use common::config::Account;
 use crate::google_driver::GoogleClient;
 use crate::auth::CookieExtractor;
-
-#[derive(Clone)]
-pub enum DriverImpl {
-    Google(GoogleClient),
-    // Anthropic(AnthropicClient),
-}
+use crate::Provider;
 
 #[derive(Clone)]
 pub struct ProtocolDriver {
-    driver:  Arc<DriverImpl>,
+    driver:  Arc<Box<dyn Provider>>,
 }
 
 impl ProtocolDriver {
-    pub fn new(_account: &Account) -> Result<Self> {
+    pub fn new(_account: &Account, browser_profile_path: Option<&str>) -> Result<Self> {
         // Attempt to extract Google cookies
         // In a real app, we'd check account type. defaulting to Google.
-        let cookies = CookieExtractor::extract_cookies("ide.google.com", &["__Secure-3PSID"])
+        let cookies = CookieExtractor::extract_cookies("ide.google.com", &["__Secure-3PSID"], browser_profile_path)
             .unwrap_or_else(|e| {
                 tracing::warn!("Failed to extract cookies: {}. Proceeding without auth (request will likely fail).", e);
                 String::new()
@@ -43,14 +38,12 @@ impl ProtocolDriver {
 
         // Detect provider type and initialize appropriate driver.
         // For now, we default to Google.
-        let driver_impl = DriverImpl::Google(GoogleClient::new(client));
+        let driver_impl: Box<dyn Provider> = Box::new(GoogleClient::new(client));
 
         Ok(Self { driver: Arc::new(driver_impl) })
     }
 
     pub async fn chat_completion(&self, prompt: &str) -> Result<String> {
-        match self.driver.as_ref() {
-            DriverImpl::Google(d) => d.generate(prompt).await,
-        }
+        self.driver.generate(prompt).await
     }
 }

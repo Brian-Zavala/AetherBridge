@@ -2,6 +2,7 @@ use axum::{
     routing::post,
     Router,
 };
+use clap::Parser;
 use common::config::Config;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,13 +12,33 @@ use tower_http::trace::TraceLayer;
 mod routes;
 mod state;
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Port to listen on
+    #[arg(short, long, default_value_t = 8080)]
+    port: u16,
+
+    /// Path to browser profile for cookie extraction
+    #[arg(long)]
+    browser_profile: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let config = Config::default();
+    let args = Args::parse();
+    let mut config = Config::default();
+
+    // Override config with CLI args
+    config.server.port = args.port;
+    if let Some(profile) = args.browser_profile {
+        config.server.browser_profile_path = Some(profile);
+    }
+
     let automator = browser_automator::Automator::new(&config)?;
-    let state = state::AppState::new(config, automator);
+    let state = state::AppState::new(config.clone(), automator);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], state.config.server.port));
 

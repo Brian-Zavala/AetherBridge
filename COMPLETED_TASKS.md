@@ -10,3 +10,17 @@
     - [x] `crates/browser-automator`: Implement browser interaction (Tauri/Headless)
 - [x] Google Protocol Driver
     - [x] Implement `GoogleClient` struct and serialization logic
+- [x] Protocol Reverse Engineering (Strategy A)
+    - [x] Reverse engineer `/_/Gho/Request` payload
+    - [x] Implement `Authentication` logic (Cookie extraction)
+    - [x] Implement `NetworkDriver` for request proxying
+- [x] Visual Proxy (Strategy B)
+    - [x] Implement `ScreenCapture` using `xcap`
+    - [x] Implement `OCR` using `ocrs`
+    - [x] Implement `InputSimulation` using `enigo`
+- [x] Tool Integration
+    - [x] Test with `Claude Code`
+    - [x] Test with `Gemini CLI`
+- [x] Production Refinement
+    - [x] Abstract `Provider` trait
+    - [x] Implement `clap` CLI for runtime config

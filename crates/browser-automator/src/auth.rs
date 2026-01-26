@@ -7,12 +7,17 @@ pub struct CookieExtractor;
 impl CookieExtractor {
     /// Extracts cookies for a specific domain by launching a headful browser
     /// and allowing the user to log in (or retrieving existing session if using a user-data-dir).
-    pub fn extract_cookies(domain: &str, cookie_names: &[&str]) -> Result<String> {
-        // TODO: Allow configuration of user-data-dir to persist sessions
-        let launch_options = LaunchOptions::default_builder()
+    pub fn extract_cookies(domain: &str, cookie_names: &[&str], user_data_dir: Option<&str>) -> Result<String> {
+        let mut builder = LaunchOptions::default_builder();
+        builder
             .headless(false) // Headful so user can login if needed
-            .idle_browser_timeout(Duration::from_secs(300))
-            .build()
+            .idle_browser_timeout(Duration::from_secs(300));
+
+        if let Some(path) = user_data_dir {
+            builder.user_data_dir(Some(std::path::PathBuf::from(path)));
+        }
+
+        let launch_options = builder.build()
             .map_err(|e| anyhow!("Failed to build launch options: {}", e))?;
 
         let browser = Browser::new(launch_options)

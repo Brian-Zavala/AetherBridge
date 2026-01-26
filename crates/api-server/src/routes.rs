@@ -9,28 +9,53 @@ use std::sync::Arc;
 use crate::state::AppState;
 
 pub async fn chat_completions(
-    State(_state): State<AppState>,
-    Json(_payload): Json<Value>,
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     tracing::info!("Received chat completion request");
-    // TODO: Implement actual logic
+
+    // Extract prompt from the last user message
+    let empty_vec = vec![];
+    let messages = payload["messages"].as_array().unwrap_or(&empty_vec);
+    let prompt = messages.iter()
+        .filter(|m| m["role"] == "user")
+        .last()
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or("");
+
+    tracing::info!("Prompt: {}", prompt);
+
+    let automator = state.automator.lock().await; // Async mutex lock
+
+    let response_text = if let Some(protocol) = &automator.protocol {
+        match protocol.chat_completion(prompt).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::error!("Protocol driver error: {}", e);
+                format!("Error: {}", e)
+            }
+        }
+    } else {
+        "Error: No protocol driver available".to_string()
+    };
+
     Json(serde_json::json!({
-        "id": "chatcmpl-123",
+        "id": "chatcmpl-bridge",
         "object": "chat.completion",
-        "created": 1677652288,
-        "model": "gpt-3.5-turbo",
+        "created": chrono::Utc::now().timestamp(),
+        "model": "google-bridge",
         "choices": [{
             "index": 0,
             "message": {
                 "role": "assistant",
-                "content": "Hello! This is a stub response from AetherBridge."
+                "content": response_text
             },
             "finish_reason": "stop"
         }],
         "usage": {
-            "prompt_tokens": 9,
-            "completion_tokens": 12,
-            "total_tokens": 21
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
         }
     }))
 }

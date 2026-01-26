@@ -1,12 +1,37 @@
+use crate::Provider;
+use async_trait::async_trait;
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
-
 
 #[derive(Clone)]
 pub struct GoogleClient {
     client: Client,
     base_url: String,
+}
+
+#[async_trait]
+impl Provider for GoogleClient {
+    async fn generate(&self, prompt: &str) -> Result<String> {
+        let payload = self.serialize_request(prompt);
+
+        // Google internal APIs often use a form-encoded POST where `f.req` contains the JSON.
+        let params = [("f.req", payload.to_string())];
+
+        let resp = self.client.post(format!("{}/_/Gho/Request", self.base_url))
+            .form(&params)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            tracing::error!("Google API Request Failed. Status: {}", resp.status());
+            return Err(anyhow!("Google API request failed: {}", resp.status()));
+        }
+
+        let text = resp.text().await?;
+        tracing::debug!("Raw Google Response: {}", text);
+        self.deserialize_response(&text)
+    }
 }
 
 impl GoogleClient {
@@ -40,24 +65,7 @@ impl GoogleClient {
         ])
     }
 
-    pub async fn generate(&self, prompt: &str) -> Result<String> {
-        let payload = self.serialize_request(prompt);
 
-        // Google internal APIs often use a form-encoded POST where `f.req` contains the JSON.
-        let params = [("f.req", payload.to_string())];
-
-        let resp = self.client.post(format!("{}/_/Gho/Request", self.base_url))
-            .form(&params)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            return Err(anyhow!("Google API request failed: {}", resp.status()));
-        }
-
-        let text = resp.text().await?;
-        self.deserialize_response(&text)
-    }
 
     fn deserialize_response(&self, raw_resp: &str) -> Result<String> {
         // Google responses are often "junk-prefixed" JSON (e.g., `)]}'\n` to prevent script inclusion).

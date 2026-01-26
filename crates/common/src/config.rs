@@ -31,6 +31,7 @@ pub enum ProviderType {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    pub browser_profile_path: Option<String>,
 }
 
 impl Default for Config {
@@ -41,6 +42,7 @@ impl Default for Config {
             server: ServerConfig {
                 host: "127.0.0.1".to_string(),
                 port: 8080,
+                browser_profile_path: None,
             },
         }
     }
