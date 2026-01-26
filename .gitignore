@@ -1,0 +1,29 @@
+# Rust
+/target/
+debug/
+release/
+**/*.rs.bk
+
+# OS
+.DS_Store
+Thumbs.db
+dist/
+*.log
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+.env
+.env.local
+.venv
+
+# Crash logs
+*.dump
+
+# Context
+AI_CONTEXT.md

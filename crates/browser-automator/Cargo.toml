@@ -1,0 +1,15 @@
+[package]
+name = "browser-automator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { version = "0.1.0", path = "../common" }
+anyhow = "1.0.100"
+enigo = "0.6.1"
+headless_chrome = "1.0.20"
+image = "0.25.9"
+ocrs = "0.12.0"
+reqwest = { version = "0.12.12", features = ["json", "cookies"] }
+tokio = "1.49.0"
+xcap = "0.8.1"
