@@ -8,6 +8,8 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::Stdout;
 use std::process::Command;
 use std::time::{Duration, Instant};
+use std::sync::Arc;
+use oauth::{OAuthFlow, AccountManager};
 
 use crate::ui;
 
@@ -84,6 +86,12 @@ pub struct App {
     pub host: String,
     /// Handle to the running server (for shutdown)
     server_handle: Option<api_server::ServerHandle>,
+    /// OAuth account manager
+    pub account_manager: Option<Arc<AccountManager>>,
+    /// Connected account emails
+    pub connected_accounts: Vec<String>,
+    /// Is OAuth login in progress?
+    pub login_in_progress: bool,
 }
 
 impl App {
@@ -103,13 +111,36 @@ impl App {
             input_mode: InputMode::Normal,
             host: "127.0.0.1".to_string(),
             server_handle: None,
+            account_manager: None,
+            connected_accounts: Vec::new(),
+            login_in_progress: false,
         };
 
         app.log_info("AetherBridge TUI started");
         app.log_info(format!("Detected {} available browser(s)", available_count));
-        app.log_info("Press [H] for help, [S] to start server");
+        app.log_info("Press [H] for help, [S] to start server, [L] to login");
 
         app
+    }
+
+    /// Initialize the account manager and load existing accounts
+    pub async fn init_account_manager(&mut self) {
+        match AccountManager::new().await {
+            Ok(manager) => {
+                let count = manager.account_count().await;
+                self.connected_accounts = manager.get_account_emails().await;
+                self.account_manager = Some(Arc::new(manager));
+
+                if count > 0 {
+                    self.log_success(format!("Loaded {} Google account(s)", count));
+                } else {
+                    self.log_info("No accounts configured. Press [L] to login.");
+                }
+            }
+            Err(e) => {
+                self.log_warning(format!("Account manager init failed: {}", e));
+            }
+        }
     }
 
     /// Detect available browsers
@@ -333,6 +364,10 @@ impl App {
             KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Char('?') => {
                 self.input_mode = InputMode::Help;
             }
+            // Login with Google
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                self.start_oauth_login().await;
+            }
             // Scroll logs up
             KeyCode::Up | KeyCode::Char('k') => {
                 self.log_scroll = self.log_scroll.saturating_sub(1);
@@ -442,6 +477,82 @@ impl App {
         self.browsers = Self::detect_browsers();
         let count = self.browsers.iter().filter(|b| b.available).count();
         self.log_success(format!("Found {} available browser(s)", count));
+    }
+
+    /// Start the OAuth login flow
+    async fn start_oauth_login(&mut self) {
+        if self.login_in_progress {
+            self.log_warning("Login already in progress...");
+            return;
+        }
+
+        self.login_in_progress = true;
+        self.log_info("Starting Google OAuth login...");
+
+        // Create OAuth flow
+        let flow = OAuthFlow::new();
+        let auth_url = flow.authorization_url();
+
+        self.log_info("Opening browser for authentication...");
+        self.log_info("Complete the login in your browser, then return here.");
+
+        // Open browser
+        if let Err(e) = open::that(&auth_url) {
+            self.log_error(format!("Failed to open browser: {}", e));
+            self.log_info(format!("Please manually open: {}", auth_url));
+        }
+
+        // Wait for the callback (with timeout)
+        self.log_info("Waiting for authorization (5 minute timeout)...");
+
+        match flow.wait_for_callback().await {
+            Ok(code) => {
+                self.log_success("Authorization code received!");
+                self.log_info("Exchanging code for tokens...");
+
+                match flow.exchange_code(&code).await {
+                    Ok(token_pair) => {
+                        self.log_success(format!("Logged in as: {}", token_pair.email));
+
+                        // Add to account manager
+                        // Clone the Arc to avoid borrow conflict
+                        let manager_arc = self.account_manager.clone();
+
+                        if let Some(manager) = manager_arc {
+                            if let Err(e) = manager.add_account(token_pair.clone()).await {
+                                self.log_warning(format!("Failed to save account: {}", e));
+                            }
+                            self.connected_accounts = manager.get_account_emails().await;
+                        } else {
+                            // Initialize account manager if not already done
+                            match AccountManager::new().await {
+                                Ok(manager) => {
+                                    if let Err(e) = manager.add_account(token_pair.clone()).await {
+                                        self.log_warning(format!("Failed to save account: {}", e));
+                                    }
+                                    self.connected_accounts = manager.get_account_emails().await;
+                                    self.account_manager = Some(Arc::new(manager));
+                                }
+                                Err(e) => {
+                                    self.log_error(format!("Failed to init account manager: {}", e));
+                                }
+                            }
+                        }
+
+                        self.log_success("Account added successfully!");
+                        self.log_info("You can now use Antigravity models via OAuth.");
+                    }
+                    Err(e) => {
+                        self.log_error(format!("Token exchange failed: {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                self.log_error(format!("OAuth callback failed: {}", e));
+            }
+        }
+
+        self.login_in_progress = false;
     }
 
     /// Periodic tick updates

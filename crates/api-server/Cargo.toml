@@ -8,6 +8,7 @@ axum = "0.8.8"
 anyhow = "1.0.100"
 browser-automator = { version = "0.1.0", path = "../browser-automator" }
 common = { version = "0.1.0", path = "../common" }
+oauth = { version = "0.1.0", path = "../oauth" }
 serde = "1.0.228"
 serde_json = "1.0.149"
 tokio = { version = "1.49.0", features = ["full"] }
@@ -17,3 +18,4 @@ tower-http = { version = "0.6.8", features = ["cors", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
 clap = { version = "4.5.1", features = ["derive", "env"] }
+uuid = { version = "1", features = ["v4"] }

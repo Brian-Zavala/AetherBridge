@@ -21,6 +21,7 @@ tokio-util = "0.7"
 common = { version = "0.1.0", path = "../common" }
 browser-automator = { version = "0.1.0", path = "../browser-automator" }
 api-server = { version = "0.1.0", path = "../api-server" }
+oauth = { version = "0.1.0", path = "../oauth" }
 
 # Error handling and logging
 anyhow = "1.0"
@@ -29,3 +30,4 @@ tracing-subscriber = "0.3"
 
 # Utilities
 chrono = "0.4"
+open = "5"  # For opening browser

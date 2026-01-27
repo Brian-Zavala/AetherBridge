@@ -1,3 +1,4 @@
+pub mod antigravity;
 pub mod auth;
 pub mod google_driver;
 pub mod protocol_driver;
@@ -5,6 +6,12 @@ pub mod visual_driver;
 
 use anyhow::Result;
 use async_trait::async_trait;
+
+// Re-export key types for external use
+pub use antigravity::{
+    AntigravityClient, AntigravityModel, Message, ChatResponse,
+    ThinkingConfig, Usage, StreamChunk,
+};
 
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -16,9 +23,12 @@ use common::config::Config;
 use protocol_driver::ProtocolDriver;
 use visual_driver::VisualDriver;
 
+/// Main automator combining protocol and visual drivers
 pub struct Automator {
     pub protocol: Option<ProtocolDriver>,
     pub visual: VisualDriver,
+    /// OAuth-based Antigravity client (new implementation)
+    pub antigravity: Option<AntigravityClient>,
 }
 
 impl Automator {
@@ -40,13 +50,33 @@ impl Automator {
             }
         };
 
+        // Antigravity client will be initialized later when OAuth tokens are available
+        let antigravity = None;
+
         Ok(Self {
             protocol,
             visual: VisualDriver::new()?,
+            antigravity,
+        })
+    }
+
+    /// Creates an Automator with an OAuth-authenticated Antigravity client
+    pub fn with_antigravity(access_token: String, project_id: Option<String>) -> Result<Self> {
+        let antigravity = Some(AntigravityClient::new(access_token, project_id)?);
+
+        Ok(Self {
+            protocol: None,
+            visual: VisualDriver::new()?,
+            antigravity,
         })
     }
 
     pub fn visual(&mut self) -> &mut VisualDriver {
         &mut self.visual
+    }
+
+    /// Sets the Antigravity client
+    pub fn set_antigravity(&mut self, client: AntigravityClient) {
+        self.antigravity = Some(client);
     }
 }

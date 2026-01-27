@@ -41,6 +41,10 @@ async fn main() -> Result<()> {
 
     // Create app and run
     let mut app = App::new();
+
+    // Initialize OAuth account manager (loads existing accounts)
+    app.init_account_manager().await;
+
     let result = app.run(&mut terminal).await;
 
     // Restore terminal
