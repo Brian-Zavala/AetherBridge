@@ -1,14 +1,11 @@
-use axum::{routing::post, Router};
+use api_server::state::AppState;
+use axum::Router;
 use clap::{Parser, Subcommand};
 use common::config::Config;
 use common::platform;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
 use tracing::Level;
-
-mod routes;
-mod state;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -92,7 +89,7 @@ async fn run_server(args: Args) -> anyhow::Result<()> {
     }
 
     let automator = browser_automator::Automator::new(&config)?;
-    let state = state::AppState::new(config.clone(), automator);
+    let state = AppState::new(config.clone(), automator);
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
 
@@ -115,11 +112,7 @@ async fn run_server(args: Args) -> anyhow::Result<()> {
 
     tracing::info!("Starting server on {}", addr);
 
-    let app = Router::new()
-        .route("/v1/chat/completions", post(routes::chat_completions))
-        .route("/v1/messages", post(routes::messages))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    let app = api_server::create_router(state);
 
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

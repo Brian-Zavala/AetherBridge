@@ -20,6 +20,7 @@ tokio-util = "0.7"
 # Workspace crates
 common = { version = "0.1.0", path = "../common" }
 browser-automator = { version = "0.1.0", path = "../browser-automator" }
+api-server = { version = "0.1.0", path = "../api-server" }
 
 # Error handling and logging
 anyhow = "1.0"

@@ -1,6 +1,7 @@
 //! Application state and update logic
 
 use anyhow::Result;
+use common::config::Config;
 use common::platform::{self, Browser};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -81,6 +82,8 @@ pub struct App {
     pub input_mode: InputMode,
     /// Host address
     pub host: String,
+    /// Handle to the running server (for shutdown)
+    server_handle: Option<api_server::ServerHandle>,
 }
 
 impl App {
@@ -99,6 +102,7 @@ impl App {
             provider: "Google".to_string(),
             input_mode: InputMode::Normal,
             host: "127.0.0.1".to_string(),
+            server_handle: None,
         };
 
         app.log_info("AetherBridge TUI started");
@@ -394,15 +398,35 @@ impl App {
                 self.log_info(format!("Starting server on port {}...", self.port));
                 self.server_state = ServerState::Starting;
 
-                // TODO: Actually start the server in a background task
-                // For now, simulate startup
-                self.server_state = ServerState::Running { port: self.port };
-                let url = format!("http://{}:{}", self.host, self.port);
-                self.log_success(format!("Server running at {}", url));
-                self.log_info("Press [C] to copy URL to clipboard");
+                // Create config with auto-detected browser profile
+                let mut config = Config::default();
+                config.server.port = self.port;
+                config.server.host = self.host.clone();
+                config.server.browser_profile_path = platform::detect_browser_profile()
+                    .map(|p| p.to_string_lossy().to_string());
+
+                // Actually start the server
+                match api_server::start_server(config, &self.host, self.port).await {
+                    Ok(handle) => {
+                        self.server_handle = Some(handle);
+                        self.server_state = ServerState::Running { port: self.port };
+                        let url = format!("http://{}:{}", self.host, self.port);
+                        self.log_success(format!("Server running at {}", url));
+                        self.log_info("Press [C] to copy URL to clipboard");
+                    }
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        self.server_state = ServerState::Error(error_msg.clone());
+                        self.log_error(format!("Failed to start server: {}", error_msg));
+                    }
+                }
             }
             ServerState::Running { .. } => {
                 self.log_info("Stopping server...");
+                // Take ownership of the handle and shut it down
+                if let Some(handle) = self.server_handle.take() {
+                    handle.shutdown();
+                }
                 self.server_state = ServerState::Stopped;
                 self.log_success("Server stopped");
             }
