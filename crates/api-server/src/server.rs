@@ -24,6 +24,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/models", get(routes::list_models))
         // Anthropic compatible endpoints
         .route("/v1/messages", post(routes::messages))
+        .route("/v1/messages/count_tokens", post(routes::count_tokens))
+        // Organization endpoint (required by Claude CLI)
+        .route("/v1/organizations/me", get(routes::get_organization))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -47,7 +50,7 @@ pub async fn start_server(
     port: u16,
 ) -> anyhow::Result<ServerHandle> {
     let automator = browser_automator::Automator::new(&config)?;
-    let state = AppState::new(config, automator);
+    let state = AppState::with_oauth(config, automator).await?;
 
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     let listener = TcpListener::bind(addr).await?;
@@ -75,7 +78,7 @@ pub async fn start_server(
 /// Start the server and block until it shuts down (for CLI usage)
 pub async fn run_server_blocking(config: Config, host: &str, port: u16) -> anyhow::Result<()> {
     let automator = browser_automator::Automator::new(&config)?;
-    let state = AppState::new(config, automator);
+    let state = AppState::with_oauth(config, automator).await?;
 
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     let listener = TcpListener::bind(addr).await?;

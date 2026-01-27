@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, warn, error};
+use tracing::{debug, warn, error, info};
 
 // =============================================================================
 // Model Definitions
@@ -230,7 +230,7 @@ pub struct AntigravityClient {
     /// Current access token
     access_token: Arc<RwLock<String>>,
     /// Project ID for API calls
-    project_id: String,
+    project_id: Arc<RwLock<String>>,
     /// Current endpoint (can fallback)
     endpoint_index: Arc<RwLock<usize>>,
 }
@@ -252,7 +252,11 @@ impl AntigravityClient {
         Ok(Self {
             client,
             access_token: Arc::new(RwLock::new(access_token)),
-            project_id: project_id.unwrap_or_else(|| ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string()),
+            project_id: Arc::new(RwLock::new(
+                std::env::var("AETHER_PROJECT_ID").ok()
+                    .or(project_id)
+                    .unwrap_or_else(|| ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string())
+            )),
             endpoint_index: Arc::new(RwLock::new(0)),
         })
     }
@@ -280,9 +284,54 @@ impl AntigravityClient {
         }
     }
 
+    /// Fetches the user's first active project ID to avoid using the shared default
+    async fn fetch_user_project(&self) {
+        // Only fetch if we are currently using the default project
+        let current = self.project_id.read().await;
+        if *current != ANTIGRAVITY_DEFAULT_PROJECT_ID {
+            return;
+        }
+        drop(current);
+
+        debug!("Fetching user project list...");
+        let token = self.access_token.read().await.clone();
+        let url = "https://cloudresourcemanager.googleapis.com/v1/projects";
+
+        match self.client
+            .get(url)
+            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    if let Ok(json) = resp.json::<Value>().await {
+                        if let Some(projects) = json.get("projects").and_then(|p| p.as_array()) {
+                            // Find first ACTIVE project
+                            for p in projects {
+                                if p.get("lifecycleState").and_then(|s| s.as_str()) == Some("ACTIVE") {
+                                    if let Some(id) = p.get("projectId").and_then(|s| s.as_str()) {
+                                        info!("Switched to user project: {}", id);
+                                        *self.project_id.write().await = id.to_string();
+                                        return;
+                                    }
+                                }
+                            }
+                            warn!("No active projects found for user. Staying on default.");
+                        }
+                    }
+                } else {
+                    debug!("Failed to list projects: {}", resp.status());
+                }
+            },
+            Err(e) => debug!("Error listing projects: {}", e),
+        }
+    }
+
     /// Builds the request body for a chat completion
     fn build_request_body(
         &self,
+        project_id: &str,
         model: AntigravityModel,
         messages: &[Message],
         thinking: Option<&ThinkingConfig>,
@@ -326,7 +375,7 @@ impl AntigravityClient {
 
         // Build the full request body
         json!({
-            "project": self.project_id,
+            "project": project_id,
             "model": model.api_id(),
             "request": {
                 "contents": contents,
@@ -342,11 +391,15 @@ impl AntigravityClient {
         messages: Vec<Message>,
         thinking: Option<ThinkingConfig>,
     ) -> Result<ChatResponse> {
+        // Ensure we have a valid project ID
+        self.fetch_user_project().await;
+
         let endpoint = self.current_endpoint().await;
         let url = format!("{}/v1internal:generateContent", endpoint);
         let token = self.access_token.read().await.clone();
+        let project_id = self.project_id.read().await.clone();
 
-        let body = self.build_request_body(model, &messages, thinking.as_ref());
+        let body = self.build_request_body(&project_id, model, &messages, thinking.as_ref());
 
         debug!("Sending request to {}", url);
         debug!("Request body: {}", serde_json::to_string_pretty(&body)?);

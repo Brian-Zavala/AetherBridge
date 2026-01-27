@@ -115,3 +115,12 @@
     - [x] Added Antigravity model list
     - [x] Added Claude Code CLI configuration guide
 - [x] Cleaned up task lists (COMPLETED_TASKS.md / INCOMPLETED_TASKS.md)
+
+## Phase 6 Fixes (2026-01-27)
+- [x] Fix Claude Code Compatibility
+    - [x] Implemented `/v1/messages/count_tokens` endpoint (Approximation)
+    - [x] Implemented `/v1/organizations/me` endpoint (Mock response)
+- [x] Fix Authentication & Connectivity
+    - [x] Solved "404 Not Found" by switching to `cloudcode-pa.googleapis.com` (Production)
+    - [x] Enforced OAuth Bearer usage over cookie extraction in `ProtocolDriver`
+    - [x] Implemented Dynamic Project ID fetching to avoid shared quota limits

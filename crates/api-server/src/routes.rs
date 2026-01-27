@@ -2,11 +2,10 @@ use axum::{
     extract::{Json, State},
     response::{Html, IntoResponse, Sse, sse::Event},
     http::StatusCode,
-    body::Body,
 };
 use serde_json::Value;
 use browser_automator::{AntigravityClient, AntigravityModel, Message as AntigravityMessage};
-use futures_util::stream::{self, Stream};
+use futures_util::stream::Stream;
 use std::convert::Infallible;
 
 use crate::state::AppState;
@@ -58,6 +57,16 @@ pub async fn health() -> impl IntoResponse {
         "service": "aether-bridge",
         "version": env!("CARGO_PKG_VERSION")
     })))
+}
+
+/// Mock organization endpoint - Claude CLI calls this on startup
+pub async fn get_organization() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "id": "org_aetherbridge",
+        "name": "AetherBridge Local",
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z"
+    }))
 }
 
 /// List available models (OpenAI compatible)
@@ -787,4 +796,49 @@ async fn messages_streaming(
     };
 
     Sse::new(stream)
+}
+
+/// Token counting endpoint
+/// Returns approximated token count (characters / 4)
+pub async fn count_tokens(
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    let mut total_chars = 0;
+
+    // Count system prompt
+    if let Some(system) = payload.get("system") {
+        if let Some(s) = system.as_str() {
+            total_chars += s.len();
+        } else if let Some(arr) = system.as_array() {
+            for block in arr {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    total_chars += text.len();
+                }
+            }
+        }
+    }
+
+    // Count messages
+    if let Some(msgs) = payload.get("messages").and_then(|m| m.as_array()) {
+        for msg in msgs {
+            if let Some(content) = msg.get("content") {
+                if let Some(text) = content.as_str() {
+                    total_chars += text.len();
+                } else if let Some(blocks) = content.as_array() {
+                    for block in blocks {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            total_chars += text.len();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Rough approximation: 1 token ~= 4 characters
+    let token_count = (total_chars as f64 / 4.0).ceil() as u32;
+
+    Json(serde_json::json!({
+        "input_tokens": token_count
+    }))
 }

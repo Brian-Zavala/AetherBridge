@@ -48,7 +48,7 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
 export ANTHROPIC_API_KEY="aetherbridge"  # Dummy key
 
 # Run the tool
-claude-code
+claude
 ```
 
 #### 💻 VS Code Extensions (Continue, Roo Code, etc.)

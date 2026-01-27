@@ -13,21 +13,34 @@ pub struct ProtocolDriver {
 }
 
 impl ProtocolDriver {
-    pub fn new(_account: &Account, browser_profile_path: Option<&str>) -> Result<Self> {
-        // Attempt to extract Google cookies
-        // In a real app, we'd check account type. defaulting to Google.
-        let cookies = CookieExtractor::extract_cookies("ide.google.com", &["__Secure-3PSID"], browser_profile_path)
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to extract cookies: {}. Proceeding without auth (request will likely fail).", e);
-                String::new()
-            });
-
-        // Initialize header map with cookies if found
+    pub fn new(account: &Account, browser_profile_path: Option<&str>) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        if !cookies.is_empty() {
-             let mut cookie_val = HeaderValue::from_str(&cookies)?;
-             cookie_val.set_sensitive(true);
-             headers.insert(COOKIE, cookie_val);
+        let mut using_oauth = false;
+
+        // 1. Try OAuth token from account config
+        if let Some(token) = account.credentials.get("access_token") {
+            tracing::info!("Using OAuth token for authentication");
+            let mut auth_val = HeaderValue::from_str(&format!("Bearer {}", token))?;
+            auth_val.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, auth_val);
+            using_oauth = true;
+        }
+
+        // 2. Fallback to cookies if no OAuth
+        if !using_oauth {
+            // Attempt to extract Google cookies
+            // We use "google.com" to catch cookies set on .google.com (like __Secure-3PSID)
+            let cookies = CookieExtractor::extract_cookies("google.com", &["__Secure-3PSID"], browser_profile_path)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to extract cookies: {}. Proceeding without auth (request will likely fail).", e);
+                    String::new()
+                });
+
+            if !cookies.is_empty() {
+                 let mut cookie_val = HeaderValue::from_str(&cookies)?;
+                 cookie_val.set_sensitive(true);
+                 headers.insert(COOKIE, cookie_val);
+            }
         }
 
         let client = ClientBuilder::new()

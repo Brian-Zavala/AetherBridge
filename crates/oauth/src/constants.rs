@@ -49,9 +49,9 @@ pub const ANTIGRAVITY_ENDPOINT_PROD: &str = "https://cloudcode-pa.googleapis.com
 
 /// Endpoint fallback order (daily → autopush → prod)
 pub const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
+    ANTIGRAVITY_ENDPOINT_PROD,
     ANTIGRAVITY_ENDPOINT_DAILY,
     ANTIGRAVITY_ENDPOINT_AUTOPUSH,
-    ANTIGRAVITY_ENDPOINT_PROD,
 ];
 
 /// Default project ID when Antigravity doesn't return one

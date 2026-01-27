@@ -1,5 +1,4 @@
 use api_server::state::AppState;
-use axum::Router;
 use clap::{Parser, Subcommand};
 use common::config::Config;
 use common::platform;
@@ -89,7 +88,7 @@ async fn run_server(args: Args) -> anyhow::Result<()> {
     }
 
     let automator = browser_automator::Automator::new(&config)?;
-    let state = AppState::new(config.clone(), automator);
+    let state = AppState::with_oauth(config.clone(), automator).await?;
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
 

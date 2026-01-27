@@ -4,7 +4,6 @@
 //! It initializes the terminal, sets up the event loop, and runs the app.
 
 mod app;
-mod event;
 mod ui;
 
 use anyhow::Result;
