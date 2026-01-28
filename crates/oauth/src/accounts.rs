@@ -267,6 +267,50 @@ impl AccountManager {
         None
     }
 
+    /// Gets an account ignoring rate limits (used for fallback retry with different model)
+    pub async fn get_available_account_ignoring_rate_limit(&self) -> Option<Account> {
+        let mut accounts = self.accounts.write().await;
+        // let rate_limits = self.rate_limits.read().await; // Ignored
+        let last_used = *self.last_used_index.read().await;
+
+        if accounts.is_empty() {
+            return None;
+        }
+
+        let account_count = accounts.len();
+
+        // Try all accounts starting from next in rotation
+        for i in 0..account_count {
+            let idx = (last_used + 1 + i) % account_count;
+            let account = accounts.get_mut(idx).expect("Account should exist");
+
+            // Refresh if needed
+            if account.needs_refresh() {
+                debug!("Refreshing token for account {} (fallback)", account.email);
+                 match refresh_access_token(&account.refresh_token).await {
+                    Ok(new_tokens) => {
+                        account.access_token = new_tokens.access_token;
+                        account.expires_at = new_tokens.expires_at;
+                        if new_tokens.refresh_token != account.refresh_token {
+                             account.refresh_token = new_tokens.refresh_token;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to refresh token for {}: {} (skipping in fallback)", account.email, e);
+                        continue; // Try next account
+                    }
+                }
+            }
+
+            // Found a usable account
+            *self.last_used_index.write().await = idx;
+            return Some(account.clone());
+        }
+
+        error!("All accounts failed refresh in fallback selection");
+        None
+    }
+
     /// Marks an account as rate-limited
     pub async fn mark_rate_limited(&self, index: usize, until: DateTime<Utc>) {
         let mut rate_limits = self.rate_limits.write().await;
@@ -363,5 +407,30 @@ mod tests {
             refresh_token: "refresh".into(),
         };
         assert!(expired_account.needs_refresh());
+    }
+
+    #[tokio::test]
+    async fn test_get_available_account_ignoring_rate_limit() {
+        let manager = AccountManager::empty();
+
+        // Add a dummy account
+        let token_pair = TokenPair {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            email: "test@example.com".into(),
+        };
+        manager.add_account(token_pair).await.unwrap();
+
+        // Mark it as rate limited
+        manager.mark_rate_limited(0, Utc::now() + chrono::Duration::hours(1)).await;
+
+        // Should be None normally
+        assert!(manager.get_available_account().await.is_none());
+
+        // Should be Some ignoring limit
+        let account = manager.get_available_account_ignoring_rate_limit().await;
+        assert!(account.is_some());
+        assert_eq!(account.unwrap().email, "test@example.com");
     }
 }

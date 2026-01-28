@@ -633,6 +633,7 @@ name = "browser-automator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "chrono",
  "common",
@@ -2950,6 +2951,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

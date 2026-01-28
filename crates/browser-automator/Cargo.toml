@@ -7,6 +7,7 @@ edition = "2024"
 common = { version = "0.1.0", path = "../common" }
 oauth = { version = "0.1.0", path = "../oauth" }
 anyhow = "1.0.100"
+async-stream = "0.3"
 async-trait = "0.1.86"
 chrono = "0.4"
 enigo = "0.6.1"

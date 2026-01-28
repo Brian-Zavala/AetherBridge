@@ -246,7 +246,7 @@ impl AntigravityClient {
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_secs(300)) // 5 min timeout for long responses
+            .timeout(std::time::Duration::from_secs(3600)) // 1 hour timeout for queuing + long thinking
             .build()?;
 
         Ok(Self {
@@ -512,6 +512,134 @@ impl AntigravityClient {
             finish_reason,
             usage,
         })
+    }
+
+    /// Sends a streaming chat completion request
+    pub async fn chat_completion_stream(
+        &self,
+        model: AntigravityModel,
+        messages: Vec<Message>,
+        thinking: Option<ThinkingConfig>,
+    ) -> Result<impl futures::Stream<Item = Result<StreamChunk>> + Send> {
+        // Ensure we have a valid project ID
+        self.fetch_user_project().await;
+
+        let endpoint = self.current_endpoint().await;
+        // Use streamGenerateContent with alt=sse
+        let url = format!("{}/v1internal:streamGenerateContent?alt=sse", endpoint);
+        let token = self.access_token.read().await.clone();
+        let project_id = self.project_id.read().await.clone();
+
+        let body = self.build_request_body(&project_id, model, &messages, thinking.as_ref());
+
+        debug!("Sending streaming request to {}", url);
+
+        let response = self.client
+            .post(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+
+        if !status.is_success() {
+            let error_text = response.text().await?;
+            // Handle rate limiting specifically
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                 return Err(anyhow!("RATE_LIMITED:60:{}", error_text));
+            }
+            error!("Streaming API error: {} - {}", status, error_text);
+            return Err(anyhow!("API error {}: {}", status, error_text));
+        }
+
+        // Process the byte stream
+        let stream = response.bytes_stream();
+
+        // Use async-stream to yield parsed chunks
+        let output_stream = async_stream::try_stream! {
+            let mut line_buffer = String::new();
+            let mut byte_stream = Box::pin(stream); // Pin the stream
+
+            use futures::StreamExt;
+            while let Some(chunk_result) = byte_stream.next().await {
+                let bytes = chunk_result?;
+                let chunk_str = String::from_utf8_lossy(&bytes);
+                // tracing::debug!("Raw stream chunk: {:?}", chunk_str); // Uncomment for deep debug
+                line_buffer.push_str(&chunk_str);
+
+                while let Some(newline_idx) = line_buffer.find('\n') {
+                    let line = line_buffer[..newline_idx].to_string();
+                    line_buffer.drain(..newline_idx + 1);
+
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() { continue; }
+
+                    tracing::debug!("Processing stream line: {}", trimmed); // DEBUG LOG
+
+                    if let Some(data) = trimmed.strip_prefix("data: ") {
+                        if data == "[DONE]" {
+                            break;
+                        }
+
+                        match serde_json::from_str::<Value>(data) {
+                             Ok(value) => {
+                                 // Parse candidates
+                                 if let Some(candidates) = value.get("candidates").and_then(|c| c.as_array()) {
+                                     if let Some(first) = candidates.first() {
+                                         if let Some(parts) = first.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
+                                             for part in parts {
+                                                 let is_thought = part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
+                                                 if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                                     yield StreamChunk {
+                                                         delta: text.to_string(),
+                                                         is_thinking: is_thought,
+                                                         done: false,
+                                                     };
+                                                 }
+                                             }
+                                         }
+                                     }
+                                 }
+                             },
+                             Err(e) => {
+                                 tracing::warn!("Failed to parse stream JSON: {} | Data: {}", e, data);
+                             }
+                        }
+                    } else {
+                        // Try parsing raw line (maybe no data: prefix?)
+                         match serde_json::from_str::<Value>(trimmed) {
+                             Ok(value) => {
+                                 // Same parsing logic (refactor if complex, but inline for now is fine)
+                                 if let Some(candidates) = value.get("candidates").and_then(|c| c.as_array()) {
+                                     if let Some(first) = candidates.first() {
+                                         if let Some(parts) = first.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
+                                             for part in parts {
+                                                 let is_thought = part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
+                                                 if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                                     yield StreamChunk {
+                                                         delta: text.to_string(),
+                                                         is_thinking: is_thought,
+                                                         done: false,
+                                                     };
+                                                 }
+                                             }
+                                         }
+                                     }
+                                 }
+                             },
+                             Err(_) => {
+                                 // Just ignore non-json lines that don't start with data:
+                                 tracing::debug!("Ignored non-data line: {}", trimmed);
+                             }
+                        }
+                    }
+                }
+            }
+            yield StreamChunk { delta: "".into(), is_thinking: false, done: true };
+        };
+
+        Ok(output_stream)
     }
 
     /// Returns the list of available models

@@ -18,6 +18,7 @@ AetherBridge now proxies requests to Google's Antigravity API using OAuth tokens
     - [x] Set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`
     - [x] Run `claude` and verify responses
     - [/] Test streaming functionality (Basic streaming works, tool use in progress)
+    - [ ] **Verify "Strategy 0" Rate Limit Fallback**: Code implemented to spoof model (e.g., Opus->Gemini) immediately on rate limit, but final robust account selector fix needs verification.
 - [ ] Implement Tool Use / Function Calling (Critical for Agentic features)
     - [ ] Handle `tool_use` and `tool_result` content blocks in `/v1/messages`
     - [ ] Map Anthropic tool definitions to Antigravity (native or via system prompt)

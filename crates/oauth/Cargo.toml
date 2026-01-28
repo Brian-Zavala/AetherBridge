@@ -21,3 +21,6 @@ keyring = "3"
 directories = "5"
 urlencoding = "2"
 futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

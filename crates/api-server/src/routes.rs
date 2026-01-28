@@ -214,27 +214,37 @@ async fn handle_antigravity_request(
     };
 
     // Get an available account
-    let account = match state.account_manager.get_available_account().await {
-        Some(acc) => acc,
-        None => {
-            // Check if rate limited
-            if let Some(wait_time) = state.account_manager.get_min_wait_time().await {
-                tracing::warn!("All accounts rate limited. Wait {} seconds", wait_time.as_secs());
-                return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+    // Get an available account with retry queueing
+    let account = loop {
+        match state.account_manager.get_available_account().await {
+            Some(acc) => break acc,
+            None => {
+                // Check wait time
+                if let Some(wait_time) = state.account_manager.get_min_wait_time().await {
+                    let wait_secs = wait_time.as_secs();
+                    if wait_secs > 600 { // Cap wait time at 10 minutes (claude-code-router default timeout is 1h)
+                         tracing::warn!("All accounts rate limited. Wait time {}s too long.", wait_secs);
+                         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+                            "error": {
+                                "message": format!("All accounts rate limited. Retry after {} seconds", wait_secs),
+                                "type": "rate_limit_error"
+                            }
+                        }))).into_response();
+                    }
+
+                    tracing::info!("All accounts rate limited. Queuing request for {} seconds...", wait_secs);
+                    tokio::time::sleep(wait_time + std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+
+                tracing::error!("No OAuth accounts configured");
+                return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
                     "error": {
-                        "message": format!("All accounts rate limited. Retry after {} seconds", wait_time.as_secs()),
-                        "type": "rate_limit_error"
+                        "message": "No Google accounts configured. Please run 'aether login' first.",
+                        "type": "authentication_error"
                     }
                 }))).into_response();
             }
-
-            tracing::error!("No OAuth accounts configured");
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-                "error": {
-                    "message": "No Google accounts configured. Please run 'aether login' first.",
-                    "type": "authentication_error"
-                }
-            }))).into_response();
         }
     };
 
@@ -361,28 +371,38 @@ pub async fn messages(
         || payload.get("extended_thinking").is_some();
 
     // Get an available OAuth account
-    let account = match state.account_manager.get_available_account().await {
-        Some(acc) => acc,
-        None => {
-            if let Some(wait_time) = state.account_manager.get_min_wait_time().await {
-                tracing::warn!("All accounts rate limited. Wait {} seconds", wait_time.as_secs());
-                return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+    // Get an available OAuth account with retry queuing
+    let account = loop {
+        match state.account_manager.get_available_account().await {
+            Some(acc) => break acc,
+            None => {
+                if let Some(wait_time) = state.account_manager.get_min_wait_time().await {
+                    let wait_secs = wait_time.as_secs();
+                    if wait_secs > 600 {
+                         tracing::warn!("All accounts rate limited. Wait time {}s too long.", wait_secs);
+                         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "type": "rate_limit_error",
+                                "message": format!("Rate limited. Retry after {} seconds", wait_secs)
+                            }
+                        }))).into_response();
+                    }
+
+                    tracing::info!("All accounts rate limited. Queuing Anthropic request for {} seconds...", wait_secs);
+                    tokio::time::sleep(wait_time + std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+
+                tracing::error!("No OAuth accounts configured");
+                return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
                     "type": "error",
                     "error": {
-                        "type": "rate_limit_error",
-                        "message": format!("Rate limited. Retry after {} seconds", wait_time.as_secs())
+                        "type": "authentication_error",
+                        "message": "No Google accounts configured. Run AetherBridge TUI and press [L] to login."
                     }
                 }))).into_response();
             }
-
-            tracing::error!("No OAuth accounts configured");
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-                "type": "error",
-                "error": {
-                    "type": "authentication_error",
-                    "message": "No Google accounts configured. Run AetherBridge TUI and press [L] to login."
-                }
-            }))).into_response();
         }
     };
 
@@ -714,61 +734,7 @@ async fn messages_streaming(
 
     // Create the stream
     let stream = async_stream::stream! {
-        // Try to get an account
-        let account = match account_manager.get_available_account().await {
-            Some(acc) => acc,
-            None => {
-                // Emit error event
-                let error_event = serde_json::json!({
-                    "type": "error",
-                    "error": {
-                        "type": "authentication_error",
-                        "message": "No Google accounts configured. Run AetherBridge TUI and press [L] to login."
-                    }
-                });
-                yield Ok(Event::default().event("error").data(error_event.to_string()));
-                return;
-            }
-        };
-
-        tracing::info!("Streaming with account: {}", account.email);
-
-        // Create client with user's project ID
-        let client = match AntigravityClient::new(account.access_token.clone(), project_id.clone()) {
-            Ok(c) => c,
-            Err(e) => {
-                let error_event = serde_json::json!({
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": format!("Failed to initialize client: {}", e)
-                    }
-                });
-                yield Ok(Event::default().event("error").data(error_event.to_string()));
-                return;
-            }
-        };
-
-        // Convert messages
-        let messages = convert_anthropic_messages(&payload);
-
-        // Configure thinking
-        let thinking_config = if thinking_enabled && model.supports_thinking() {
-            let budget = payload["thinking"]
-                .get("budget_tokens")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
-                .or(Some(10000));
-            Some(browser_automator::ThinkingConfig {
-                budget,
-                level: None,
-                include_thoughts: true,
-            })
-        } else {
-            None
-        };
-
-        // Emit message_start event
+        // 1. Emit message_start IMMEDIATELY to ack connection
         let message_start = serde_json::json!({
             "type": "message_start",
             "message": {
@@ -787,210 +753,378 @@ async fn messages_streaming(
         });
         yield Ok(Event::default().event("message_start").data(message_start.to_string()));
 
-        // Make the actual API call (non-streaming for now - Antigravity doesn't expose SSE)
-        let result = client.chat_completion(model, messages.clone(), thinking_config.clone()).await;
+        // 2. Start a "System Log" block to report status (as text so it's visible)
+        let mut block_index = 0;
+        let status_block_index = block_index;
 
-        let api_result = match result {
-            Err(e) => {
-                let error_str = e.to_string();
+        // Use a text block for status updates because 'thinking' blocks are often hidden/collapsed in UIs
+        let block_start = serde_json::json!({
+            "type": "content_block_start",
+            "index": status_block_index,
+            "content_block": {
+                "type": "text",
+                "text": ""
+            }
+        });
+        yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
 
-                // Trigger fallback on Rate Limit (429), Forbidden (403 - Quota), or Overloaded (503)
-                if error_str.starts_with("RATE_LIMITED:")
-                    || error_str.contains("429")
-                    || error_str.contains("403")
-                    || error_str.contains("503")
-                {
-                     // Parse retry duration
-                     let parts: Vec<&str> = error_str.splitn(3, ':').collect();
-                     let seconds = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
-                     let until = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
+        // Helper to send status text
+        let status_msg = "> **AetherBridge System Log**\n> Finding available account...\n";
+        let delta = serde_json::json!({
+             "type": "content_block_delta",
+             "index": status_block_index,
+             "delta": { "type": "text_delta", "text": status_msg }
+        });
+        yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
 
-                     // Mark CURRENT account as rate limited
-                     account_manager.mark_rate_limited(account.index, until).await;
-                     tracing::warn!("Streaming: Account {} rate limited. Attempting mitigation...", account.index);
 
-                     // Strategy 1: Spoof on SAME account
-                     let mut spoof_success = false;
-                     let mut final_res = Err(e);
+        // 3. Get Account Loop with Status Updates
+        let mut model = model; // Make mutable for spoofing
+        let account = loop {
+             match account_manager.get_available_account().await {
+                Some(acc) => break acc,
+                None => {
+                    // Check for Pre-emptive Spoofing (Strategy 0)
+                    tracing::info!("Primary model rate limited. Checking Strategy 0 fallback for {:?}", model);
+                    if let Some(spoof_model) = get_spoof_model(model) {
+                         tracing::info!("Spoof model available: {:?}", spoof_model);
+                         if let Some(acc) = account_manager.get_available_account_ignoring_rate_limit().await {
+                             // Log the pre-emptive switch
+                             tracing::info!("Strategy 0: Ignoring rate limit and using account {} for spoof model {:?}", acc.email, spoof_model);
+                             let msg = format!("> Primary model rate limited. Strategy 0: Pre-emptive Spoofing {:?} on account {}...\n", spoof_model, acc.email);
+                             let delta = serde_json::json!({
+                                  "type": "content_block_delta",
+                                  "index": status_block_index,
+                                  "delta": { "type": "text_delta", "text": msg }
+                             });
+                             yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
 
-                     if let Some(spoof_model) = get_spoof_model(model) {
-                         tracing::warn!("Streaming Strategy 1: Spoofing {:?} on same account...", spoof_model);
-                         let spoof_config = adapt_config_for_spoof(&thinking_config, spoof_model);
-                         match client.chat_completion(spoof_model, messages.clone(), spoof_config.clone()).await {
-                             Ok(res) => {
-                                 spoof_success = true;
-                                 final_res = Ok(res);
-                             },
-                             Err(e2) => {
-                                 tracing::warn!("Streaming Strategy 1 Failed: {}", e2);
-                             }
-                         }
-                     }
-
-                     if !spoof_success {
-                         // Strategy 2: Rotate Account
-                         tracing::warn!("Streaming Strategy 2: Rotating account...");
-                         if let Some(new_account) = account_manager.get_available_account().await {
-                             tracing::info!("Streaming switched to account: {}", new_account.email);
-
-                             // Need to construct new client with the NEW account token
-                             // Note: We need to clone project_id again.
-                             // CAUTION: 'project_id' variable from outer scope might be moved if not careful,
-                             // but it was cloned for 'client' creation earlier. We need to be sure we have it.
-                             // We cloned it at line 737: `project_id.clone()`. The original `project_id` is still available?
-                             // Yes, line 737 used a clone. `project_id` (the local var) is available.
-
-                             if let Ok(new_client) = AntigravityClient::new(new_account.access_token.clone(), project_id.clone()) {
-
-                                 // Try Spoof immediately on new account
-                                 let target_model = if let Some(spoof) = get_spoof_model(model) { spoof } else { model };
-                                 let target_config = if target_model != model {
-                                     adapt_config_for_spoof(&thinking_config, target_model)
-                                 } else {
-                                     thinking_config.clone()
-                                 };
-
-                                 match new_client.chat_completion(target_model, messages, target_config).await {
-                                     Ok(res) => {
-                                         account_manager.clear_rate_limit(new_account.index).await;
-                                         final_res = Ok(res);
-                                     },
-                                     Err(e3) => {
-                                         tracing::error!("Streaming Strategy 2 Failed: {}", e3);
-                                         final_res = Err(e3);
-                                     }
-                                 }
-                             }
+                             // Swap model and proceed
+                             model = spoof_model;
+                             break acc;
                          } else {
-                             tracing::error!("Streaming: No alternative accounts available.");
+                             tracing::warn!("Strategy 0 Failed: Could not find ANY account (even ignoring rate limits) to try spoofing.");
                          }
-                     }
-                     final_res
-                } else {
-                    Err(e)
-                }
-            },
-            Ok(res) => Ok(res),
-        };
+                    } else {
+                        tracing::info!("No spoof model defined for {:?}, skipping Strategy 0.", model);
+                    }
 
-        match api_result {
-            Ok(response) => {
-                account_manager.clear_rate_limit(account.index).await;
+                    if let Some(wait_time) = account_manager.get_min_wait_time().await {
+                        let wait_secs = wait_time.as_secs();
+                        if wait_secs > 600 {
+                            // Close status block
+                            let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
+                            yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
 
-                let mut block_index = 0;
-
-                // If there's thinking content, emit it first
-                if let Some(ref thinking) = response.thinking {
-                    // content_block_start for thinking
-                    let block_start = serde_json::json!({
-                        "type": "content_block_start",
-                        "index": block_index,
-                        "content_block": {
-                            "type": "thinking",
-                            "thinking": ""
+                            // Report Error
+                            let error_event = serde_json::json!({
+                                "type": "error",
+                                "error": {
+                                    "type": "rate_limit_error",
+                                    "message": format!("Rate limited. Retry after {} seconds", wait_secs)
+                                }
+                            });
+                            yield Ok(Event::default().event("error").data(error_event.to_string()));
+                            return;
                         }
-                    });
-                    yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
 
-                    // Emit thinking content in chunks (simulate streaming)
-                    for chunk in thinking.chars().collect::<Vec<_>>().chunks(50) {
-                        let chunk_str: String = chunk.iter().collect();
+                        // Report waiting status
+                        let msg = format!("> Rate limited. Queuing for {} seconds...\n", wait_secs);
                         let delta = serde_json::json!({
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {
-                                "type": "thinking_delta",
-                                "thinking": chunk_str
-                            }
+                             "type": "content_block_delta",
+                             "index": status_block_index,
+                             "delta": { "type": "text_delta", "text": msg }
                         });
                         yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
-                        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+
+                        tokio::time::sleep(wait_time + std::time::Duration::from_secs(1)).await;
+                        continue;
                     }
 
-                    // content_block_stop
-                    let block_stop = serde_json::json!({
-                        "type": "content_block_stop",
-                        "index": block_index
-                    });
-                    yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+                    // No accounts configured
+                     let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
+                     yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
 
-                    block_index += 1;
-                }
-
-                // Emit main text content
-                let text_block_start = serde_json::json!({
-                    "type": "content_block_start",
-                    "index": block_index,
-                    "content_block": {
-                        "type": "text",
-                        "text": ""
-                    }
-                });
-                yield Ok(Event::default().event("content_block_start").data(text_block_start.to_string()));
-
-                // Stream the text content in chunks (simulate streaming)
-                for chunk in response.content.chars().collect::<Vec<_>>().chunks(20) {
-                    let chunk_str: String = chunk.iter().collect();
-                    let delta = serde_json::json!({
-                        "type": "content_block_delta",
-                        "index": block_index,
-                        "delta": {
-                            "type": "text_delta",
-                            "text": chunk_str
+                    let error_event = serde_json::json!({
+                        "type": "error",
+                        "error": {
+                            "type": "authentication_error",
+                            "message": "No Google accounts configured. Run AetherBridge TUI and press [L] to login."
                         }
                     });
-                    yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    yield Ok(Event::default().event("error").data(error_event.to_string()));
+                    return;
                 }
-
-                // content_block_stop
-                let text_block_stop = serde_json::json!({
-                    "type": "content_block_stop",
-                    "index": block_index
-                });
-                yield Ok(Event::default().event("content_block_stop").data(text_block_stop.to_string()));
-
-                // Emit message_delta with stop reason
-                let usage = response.usage.as_ref();
-                let message_delta = serde_json::json!({
-                    "type": "message_delta",
-                    "delta": {
-                        "stop_reason": &response.finish_reason,
-                        "stop_sequence": null
-                    },
-                    "usage": {
-                        "output_tokens": usage.map(|u| u.completion_tokens).unwrap_or(0)
-                    }
-                });
-                yield Ok(Event::default().event("message_delta").data(message_delta.to_string()));
-
-                // Emit message_stop
-                let message_stop = serde_json::json!({
-                    "type": "message_stop"
-                });
-                yield Ok(Event::default().event("message_stop").data(message_stop.to_string()));
             }
-            Err(e) => {
-                let error_str = e.to_string();
+        };
 
-                // Check for rate limiting
-                if error_str.starts_with("RATE_LIMITED:") {
-                    let parts: Vec<&str> = error_str.splitn(3, ':').collect();
-                    let seconds = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
-                    let until = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
-                    account_manager.mark_rate_limited(account.index, until).await;
-                }
+        tracing::info!("Streaming with account: {}", account.email);
+
+        // Report Processing
+        let msg = format!("> Using account: {}. Generating response...\n\n", account.email);
+        let delta = serde_json::json!({
+                "type": "content_block_delta",
+                "index": status_block_index,
+                "delta": { "type": "text_delta", "text": msg }
+        });
+        yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+
+
+        // 4. Create Client
+        let client = match AntigravityClient::new(account.access_token.clone(), project_id.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
+                yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
 
                 let error_event = serde_json::json!({
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": error_str
+                        "message": format!("Failed to initialize client: {}", e)
                     }
                 });
                 yield Ok(Event::default().event("error").data(error_event.to_string()));
+                return;
             }
-        }
+        };
+
+        // Close our status block so the real answer starts clean (or continues?)
+        // Let's close it so the real answer is distinct.
+        let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
+        yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+        block_index += 1;
+
+        // 5. Convert Messages & Config
+        let messages = convert_anthropic_messages(&payload);
+        let thinking_config = if thinking_enabled && model.supports_thinking() {
+             let budget = payload["thinking"]
+                .get("budget_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .or(Some(10000));
+            Some(browser_automator::ThinkingConfig {
+                budget,
+                level: None,
+                include_thoughts: true,
+            })
+        } else {
+            None
+        };
+
+        // 6. Make API Streaming Request
+        tracing::info!("Starting streaming request to Antigravity model: {:?}", model);
+        let start_time = std::time::Instant::now();
+        let result = client.chat_completion_stream(model, messages.clone(), thinking_config.clone()).await;
+
+        match result {
+            Ok(output_stream) => { // Removed mut here, pin! handles it
+                 account_manager.clear_rate_limit(account.index).await;
+
+                 use futures_util::StreamExt;
+                 // Pin the stream so we can call next()
+                 tokio::pin!(output_stream);
+
+                 // We will simply stream everything into a single text block to guarantee visibility.
+                 // System logs (index 0) are closed. We start index 1.
+                 let text_index = block_index;
+
+                 let block_start = serde_json::json!({
+                    "type": "content_block_start",
+                    "index": text_index,
+                    "content_block": { "type": "text", "text": "" }
+                 });
+                 yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
+
+                 let mut inside_thought = false;
+
+                 while let Some(chunk_res) = output_stream.next().await {
+                     match chunk_res {
+                         Ok(chunk) => {
+                             if chunk.done { break; }
+
+                             let mut text_to_emit = chunk.delta;
+
+                             // Optional: Visual indication of thinking vs answer
+                             if chunk.is_thinking {
+                                 if !inside_thought {
+                                     // Start of a thought sequence
+                                     text_to_emit = format!("\n> *Thinking: {}*", text_to_emit);
+                                     inside_thought = true;
+                                 } else {
+                                     // Continue thought - maybe italicize?
+                                     // Markdown within a stream is tricky, usually we just dump text.
+                                     // Let's just dump it. formatting every chunk is risky.
+                                 }
+                             } else {
+                                 if inside_thought {
+                                     // End of thought sequence
+                                     text_to_emit = format!("\n\n{}", text_to_emit);
+                                     inside_thought = false;
+                                 }
+                             }
+
+                             let delta = serde_json::json!({
+                                "type": "content_block_delta",
+                                "index": text_index,
+                                "delta": { "type": "text_delta", "text": text_to_emit }
+                             });
+                             yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+                         },
+                         Err(e) => {
+                             let err_msg = e.to_string();
+                             tracing::error!("Stream chunk error: {}", err_msg);
+                             let error_event = serde_json::json!({
+                                "type": "error",
+                                "error": { "type": "api_error", "message": err_msg }
+                            });
+                            yield Ok(Event::default().event("error").data(error_event.to_string()));
+                            return;
+                         }
+                     }
+                 }
+
+                 let elapsed = start_time.elapsed();
+                 tracing::info!("Stream finished in {:.2?}", elapsed);
+
+                 // Close text block
+                 let block_stop = serde_json::json!({ "type": "content_block_stop", "index": text_index });
+                 yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+
+                 // Message Delta and Stop
+                 let message_delta = serde_json::json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                    "usage": { "output_tokens": 0 }
+                 });
+                 yield Ok(Event::default().event("message_delta").data(message_delta.to_string()));
+
+                 let message_stop = serde_json::json!({ "type": "message_stop" });
+                 yield Ok(Event::default().event("message_stop").data(message_stop.to_string()));
+            }
+            Err(e) => {
+                let error_str = e.to_string();
+                tracing::warn!("Antigravity API Error: '{}'", error_str);
+
+                // Rate Limit Handling
+                if error_str.starts_with("RATE_LIMITED:") {
+                     let parts: Vec<&str> = error_str.splitn(3, ':').collect();
+                     let seconds = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
+                     let until = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
+                     account_manager.mark_rate_limited(account.index, until).await;
+
+                     // Strategy 1: Spoofing Fallback
+                     if let Some(spoof_model) = get_spoof_model(model) {
+                         let msg = format!("\n> Rate limit hit. Fallback Strategy 1: Spoofing {:?} on same account...\n", spoof_model);
+                         let delta = serde_json::json!({
+                              "type": "content_block_delta",
+                              "index": status_block_index,
+                              "delta": { "type": "text_delta", "text": msg }
+                         });
+                         yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+
+                         // Adapt config and retry
+                         let spoof_config = adapt_config_for_spoof(&thinking_config, spoof_model);
+                         match client.chat_completion_stream(spoof_model, messages.clone(), spoof_config.clone()).await {
+                             Ok(spoof_stream) => {
+                                 // SUCCESS: Reuse the stream handling logic
+                                 // We need to duplicate the stream handling loop here or refactor.
+                                 // For now, duplication is safer to avoid complex borrow checker issues with recursion/closures in async gen blocks.
+
+                                 account_manager.clear_rate_limit(account.index).await;
+                                 use futures_util::StreamExt;
+                                 let mut output_stream = spoof_stream; // Move ownership
+                                 tokio::pin!(output_stream);
+
+                                 // Close status block
+                                 let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
+                                 yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+
+                                 // Start text block
+                                 let text_index = block_index + 1; // Increment for new block
+                                 let block_start = serde_json::json!({
+                                    "type": "content_block_start",
+                                    "index": text_index,
+                                    "content_block": { "type": "text", "text": "" }
+                                 });
+                                 yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
+
+                                 let mut inside_thought = false;
+                                 while let Some(chunk_res) = output_stream.next().await {
+                                     match chunk_res {
+                                         Ok(chunk) => {
+                                             if chunk.done { break; }
+                                             let mut text_to_emit = chunk.delta;
+                                             if chunk.is_thinking {
+                                                 if !inside_thought {
+                                                     text_to_emit = format!("\n> *Thinking: {}*", text_to_emit);
+                                                     inside_thought = true;
+                                                 }
+                                             } else {
+                                                 if inside_thought {
+                                                     text_to_emit = format!("\n\n{}", text_to_emit);
+                                                     inside_thought = false;
+                                                 }
+                                             }
+                                             let delta = serde_json::json!({
+                                                "type": "content_block_delta",
+                                                "index": text_index,
+                                                "delta": { "type": "text_delta", "text": text_to_emit }
+                                             });
+                                             yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+                                         },
+                                         Err(e) => {
+                                             let err_msg = e.to_string();
+                                             tracing::error!("Spoof Stream chunk error: {}", err_msg);
+                                              let error_event = serde_json::json!({
+                                                "type": "error",
+                                                "error": { "type": "api_error", "message": err_msg }
+                                            });
+                                            yield Ok(Event::default().event("error").data(error_event.to_string()));
+                                            return;
+                                         }
+                                     }
+                                 }
+                                 // Stream finished successfully
+                                 let block_stop = serde_json::json!({ "type": "content_block_stop", "index": text_index });
+                                 yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+                                 let message_delta = serde_json::json!({
+                                    "type": "message_delta",
+                                    "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                                    "usage": { "output_tokens": 0 }
+                                 });
+                                 yield Ok(Event::default().event("message_delta").data(message_delta.to_string()));
+                                 let message_stop = serde_json::json!({ "type": "message_stop" });
+                                 yield Ok(Event::default().event("message_stop").data(message_stop.to_string()));
+                                 return; // Done
+                             },
+                             Err(e2) => {
+                                 tracing::error!("Spoofing attempt failed: {}", e2);
+                                 let msg = format!("> Spoofing failed: {}\n", e2);
+                                 let delta = serde_json::json!({
+                                      "type": "content_block_delta",
+                                      "index": status_block_index,
+                                      "delta": { "type": "text_delta", "text": msg }
+                                 });
+                                 yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+                                 // Fall through to original error report
+                             }
+                         }
+                     }
+                }
+
+                // Close status block before error
+                let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
+                yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+
+                // Emit original error
+                 let error_event = serde_json::json!({
+                    "type": "error",
+                    "error": { "type": "api_error", "message": error_str }
+                });
+                yield Ok(Event::default().event("error").data(error_event.to_string()));
+            }
+        };
     };
 
     Sse::new(stream)
