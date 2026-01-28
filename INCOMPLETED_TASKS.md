@@ -34,12 +34,7 @@ AetherBridge now proxies requests to Google's Antigravity API using OAuth tokens
         - If missing, open browser to Project IDX/Cloud Console with one keypress.
         - Interactive guide to link/select the new project ID automatically.
     - [ ] **Rate Limit Handler**: Actionable modals for 429 errors with direct fix buttons.
-- [ ] **Smart Model Spoofing & Fallback**
-    - [ ] **Rate Limit Fallback**: Automatically retry with Gemini models if Claude 4.5 hits 429.
-    - [ ] **Intelligent Mapping**:
-        - Opus 4.5 -> Gemini 3 Pro
-        - Sonnet 4.5 -> Gemini 3 Flash
-    - [ ] **TUI Configuration**: Toggle for "Auto-Spoof" / "Prefer Gemini".
+
 - [ ] Document known limitations/workarounds
 
 ## Phase 2: Expand CLI Tool Support

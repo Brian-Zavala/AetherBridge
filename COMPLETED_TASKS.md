@@ -123,4 +123,14 @@
 - [x] Fix Authentication & Connectivity
     - [x] Solved "404 Not Found" by switching to `cloudcode-pa.googleapis.com` (Production)
     - [x] Enforced OAuth Bearer usage over cookie extraction in `ProtocolDriver`
-    - [x] Implemented Dynamic Project ID fetching to avoid shared quota limits
+
+## Phase 7: Robust Rate Limit Handling (2026-01-27)
+- [x] **Smart Model Spoofing & Fallback**
+    - [x] **Rate Limit Fallback**: Automatically retry with Gemini models if Claude 4.5 hits 429.
+      - *Implemented Hybrid Strategy: Try Spoof (Same Account) -> If Fail, Rotate Account -> Spoof (New Account)*
+      - *Broadened Error Triggers*: Catches 429, 403 (Project Quota), and 503 errors.
+    - [x] **Streaming Endpoint Support**: Applied robust fallback logic to `/v1/messages` streaming path (used by `claude-code`).
+    - [x] **Intelligent Mapping**:
+        - Opus 4.5 -> `gemini-3-pro-preview`
+        - Sonnet 4.5 -> `gemini-3-flash-preview`
+    - [x] **Model ID Verification**: Updated to confirmed Cloud Code Preview IDs (`gemini-3-pro-preview`, `gemini-3-flash-preview`).

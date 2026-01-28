@@ -56,12 +56,24 @@ pub enum LogLevel {
     Error,
 }
 
+/// Wizard step state
+#[derive(Debug, Clone, PartialEq)]
+pub enum WizardState {
+    Welcome,
+    CheckProjectId,
+    ProjectIdInput(String),
+    ConfigureClaude,
+    ExportShell(String),
+    Finished,
+}
+
 /// Active input mode
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputMode {
     Normal,
     PortInput(String),
     Help,
+    Wizard(WizardState),
 }
 
 /// Main application state
@@ -92,6 +104,8 @@ pub struct App {
     pub connected_accounts: Vec<String>,
     /// Is OAuth login in progress?
     pub login_in_progress: bool,
+    /// Persistent configuration
+    pub config: Config,
 }
 
 impl App {
@@ -100,25 +114,43 @@ impl App {
         let browsers = Self::detect_browsers();
         let available_count = browsers.iter().filter(|b| b.available).count();
 
+        // Load config or default
+        let config = Config::load().unwrap_or_else(|e| {
+            eprintln!("Failed to load config: {}", e);
+            Config::default()
+        });
+
+        // Determine initial mode
+        let input_mode = if config.project_id.is_none() {
+            InputMode::Wizard(WizardState::Welcome)
+        } else {
+            InputMode::Normal
+        };
+
         let mut app = Self {
             running: true,
             server_state: ServerState::Stopped,
             browsers,
             logs: Vec::new(),
             log_scroll: 0,
-            port: 8080,
+            port: config.server.port,
             provider: "Google".to_string(),
-            input_mode: InputMode::Normal,
-            host: "127.0.0.1".to_string(),
+            input_mode,
+            host: config.server.host.clone(),
             server_handle: None,
             account_manager: None,
             connected_accounts: Vec::new(),
             login_in_progress: false,
+            config,
         };
 
-        app.log_info("AetherBridge TUI started");
-        app.log_info(format!("Detected {} available browser(s)", available_count));
-        app.log_info("Press [H] for help, [S] to start server, [L] to login");
+        if matches!(app.input_mode, InputMode::Wizard(_)) {
+            app.log_info("Welcome! Starting setup wizard...");
+        } else {
+            app.log_info("AetherBridge TUI started");
+            app.log_info(format!("Detected {} available browser(s)", available_count));
+            app.log_info("Press [H] for help, [S] to start server, [L] to login");
+        }
 
         app
     }
@@ -134,7 +166,9 @@ impl App {
                 if count > 0 {
                     self.log_success(format!("Loaded {} Google account(s)", count));
                 } else {
-                    self.log_info("No accounts configured. Press [L] to login.");
+                    if !matches!(self.input_mode, InputMode::Wizard(_)) {
+                         self.log_info("No accounts configured. Press [L] to login.");
+                    }
                 }
             }
             Err(e) => {
@@ -324,6 +358,7 @@ impl App {
         match &self.input_mode {
             InputMode::Normal => self.handle_normal_key(key).await,
             InputMode::PortInput(current) => self.handle_port_input(key, current.clone()),
+            InputMode::Wizard(state) => self.handle_wizard_key(key, state.clone()).await,
             InputMode::Help => {
                 // Any key exits help
                 self.input_mode = InputMode::Normal;
@@ -397,6 +432,10 @@ impl App {
                 if let Ok(port) = current.parse::<u16>() {
                     if port > 0 {
                         self.port = port;
+                        self.config.server.port = port;
+                         if let Err(e) = self.config.save() {
+                             self.log_error(format!("Failed to save config: {}", e));
+                         }
                         self.log_success(format!("Port set to {}", port));
                     } else {
                         self.log_error("Invalid port number (must be 1-65535)");
@@ -426,6 +465,150 @@ impl App {
         }
     }
 
+    /// Handle keys in wizard mode
+    async fn handle_wizard_key(&mut self, key: KeyCode, state: WizardState) {
+        match state {
+            WizardState::Welcome => {
+                // Any key to continue
+                if matches!(key, KeyCode::Enter | KeyCode::Char(' ')) {
+                    self.input_mode = InputMode::Wizard(WizardState::CheckProjectId);
+                } else if matches!(key, KeyCode::Esc | KeyCode::Char('q')) {
+                    self.running = false;
+                }
+            }
+            WizardState::CheckProjectId => {
+                 match key {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                         self.input_mode = InputMode::Wizard(WizardState::ProjectIdInput(String::new()));
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        self.log_info("Opening Google Cloud Console to create a project...");
+                        if let Err(e) = open::that("https://console.cloud.google.com/projectcreate") {
+                            self.log_error(format!("Failed to open browser: {}", e));
+                            self.log_info("Please manually visit: https://console.cloud.google.com/projectcreate");
+                        }
+                        self.input_mode = InputMode::Wizard(WizardState::ProjectIdInput(String::new()));
+                    }
+                     KeyCode::Esc => {
+                        self.running = false;
+                    }
+                    _ => {}
+                }
+            }
+            WizardState::ProjectIdInput(current) => {
+                match key {
+                    KeyCode::Enter => {
+                        if !current.is_empty() {
+                            self.config.project_id = Some(current.clone());
+                            if let Err(e) = self.config.save() {
+                                self.log_error(format!("Failed to save config: {}", e));
+                            } else {
+                                self.log_success("Configuration saved!");
+                            }
+
+                            // Transition to ConfigureClaude instead of ExportShell directly
+                            use common::shell::Shell;
+                            let shell = Shell::detect();
+                            if shell != Shell::Unknown && shell != Shell::PowerShell {
+                                self.input_mode = InputMode::Wizard(WizardState::ConfigureClaude);
+                            } else {
+                                self.input_mode = InputMode::Wizard(WizardState::Finished);
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        let mut new = current;
+                        new.pop();
+                        self.input_mode = InputMode::Wizard(WizardState::ProjectIdInput(new));
+                    }
+                    KeyCode::Char(c) if c.is_ascii_graphic() => {
+                        let mut new = current;
+                        new.push(c);
+                        self.input_mode = InputMode::Wizard(WizardState::ProjectIdInput(new));
+                    }
+                     KeyCode::Esc => {
+                        self.running = false;
+                    }
+                    _ => {}
+                }
+            }
+            WizardState::ConfigureClaude => {
+                match key {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        use common::shell::Shell;
+                        if let Err(e) = Shell::configure_claude() {
+                            self.log_error(format!("Failed to configure Claude Code: {}", e));
+                        } else {
+                            self.log_success("Claude Code configured to bypass onboarding!");
+                        }
+                        // Move to ExportShell, passing project_id which we need to retrieve from config
+                        if let Some(project_id) = &self.config.project_id {
+                             self.input_mode = InputMode::Wizard(WizardState::ExportShell(project_id.clone()));
+                        } else {
+                             self.input_mode = InputMode::Wizard(WizardState::Finished);
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        self.log_warning("Skipping Claude Code configuration...");
+                        if let Some(project_id) = &self.config.project_id {
+                             self.input_mode = InputMode::Wizard(WizardState::ExportShell(project_id.clone()));
+                        } else {
+                             self.input_mode = InputMode::Wizard(WizardState::Finished);
+                        }
+                    }
+                     KeyCode::Esc => {
+                        self.running = false;
+                    }
+                    _ => {}
+                }
+            }
+            WizardState::ExportShell(project_id) => {
+                match key {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        use common::shell::Shell;
+                        let shell = Shell::detect();
+                        let mut success = true;
+
+                        // Export PROJECT ID
+                        if let Err(e) = shell.export_env("GOOGLE_CLOUD_PROJECT", &project_id) {
+                            self.log_error(format!("Failed to export GOOGLE_CLOUD_PROJECT: {}", e));
+                            success = false;
+                        }
+
+                        // Export Claude Code variables
+                        if let Err(e) = shell.export_env("ANTHROPIC_BASE_URL", "http://127.0.0.1:8080") {
+                             self.log_error(format!("Failed to export ANTHROPIC_BASE_URL: {}", e));
+                             success = false;
+                        }
+                        if let Err(e) = shell.export_env("ANTHROPIC_API_KEY", "sk-ant-aetherbridge-bypass-key") {
+                             self.log_error(format!("Failed to export ANTHROPIC_API_KEY: {}", e));
+                             success = false;
+                        }
+
+                        if success {
+                            self.log_success(format!("Added exports to {}", shell.name()));
+                            self.log_info("Please restart your shell or run 'source <config_file>'");
+                        }
+                        self.input_mode = InputMode::Wizard(WizardState::Finished);
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        self.input_mode = InputMode::Wizard(WizardState::Finished);
+                    }
+                     KeyCode::Esc => {
+                        self.running = false;
+                    }
+                    _ => {}
+                }
+            }
+            WizardState::Finished => {
+                self.input_mode = InputMode::Normal;
+                self.log_info("Setup complete! You can now use AetherBridge.");
+                self.log_info(format!("Detected {} available browser(s)", self.browsers.iter().filter(|b| b.available).count()));
+                self.log_info("Press [H] for help, [S] to start server, [L] to login");
+            }
+        }
+    }
+
     /// Toggle server start/stop
     async fn toggle_server(&mut self) {
         match &self.server_state {
@@ -437,8 +620,11 @@ impl App {
                 let mut config = Config::default();
                 config.server.port = self.port;
                 config.server.host = self.host.clone();
-                config.server.browser_profile_path = platform::detect_browser_profile()
-                    .map(|p| p.to_string_lossy().to_string());
+                // Prefer config path if set, otherwise detect
+                config.server.browser_profile_path = self.config.server.browser_profile_path.clone()
+                    .or_else(|| platform::detect_browser_profile().map(|p| p.to_string_lossy().to_string()));
+                config.project_id = self.config.project_id.clone();
+
 
                 // Actually start the server
                 match api_server::start_server(config, &self.host, self.port).await {

@@ -11,7 +11,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, InputMode, LogLevel, ServerState};
+use crate::app::{App, InputMode, LogLevel, ServerState, WizardState};
 
 /// Primary colors for the UI
 const ACCENT_COLOR: Color = Color::Cyan;
@@ -22,6 +22,12 @@ const MUTED_COLOR: Color = Color::DarkGray;
 
 /// Render the entire UI
 pub fn render(frame: &mut Frame, app: &App) {
+    // If in Wizard mode, render only the wizard
+    if let InputMode::Wizard(state) = &app.input_mode {
+        render_wizard(frame, state);
+        return;
+    }
+
     // Main layout: Header, Content, Footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -45,6 +51,160 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     if let InputMode::PortInput(ref current) = app.input_mode {
         render_port_input(frame, current);
+    }
+}
+
+/// Render the Wizard UI
+fn render_wizard(frame: &mut Frame, state: &WizardState) {
+    let area = centered_rect(60, 50, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" AetherBridge Setup Wizard ")
+        .title_style(Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_set(border::DOUBLE)
+        .border_style(Style::default().fg(ACCENT_COLOR));
+
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
+
+    match state {
+        WizardState::Welcome => {
+            let text = vec![
+                Line::from(""),
+                Line::from(Span::styled("Welcome to AetherBridge!", Style::default().fg(SUCCESS_COLOR).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from("This tool bridges your local environment with Google's Cloud Code."),
+                Line::from("To ensure reliable access, we need to set up a few things."),
+                Line::from(""),
+                Line::from("In the next step, you'll be asked for a Google Cloud Project ID."),
+                Line::from("This ID is used to validate your session with the AI models."),
+                Line::from(""),
+                Line::from(Span::styled("Press [Enter] to continue", Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::SLOW_BLINK))),
+            ];
+
+            let paragraph = Paragraph::new(text)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true });
+            frame.render_widget(paragraph, inner_area);
+        }
+        WizardState::CheckProjectId => {
+             let text = vec![
+                Line::from(""),
+                Line::from(Span::styled("Do you have a Google Cloud Project ID?", Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from("To use the AI models, you need a Google Cloud Project with the Cloud AI Companion API enabled."),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("[Y] Yes", Style::default().fg(SUCCESS_COLOR).add_modifier(Modifier::BOLD)),
+                    Span::raw("  I already have one"),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("[N] No", Style::default().fg(WARNING_COLOR).add_modifier(Modifier::BOLD)),
+                    Span::raw("   Create one for me (opens browser)"),
+                ]),
+            ];
+
+            let paragraph = Paragraph::new(text)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true });
+            frame.render_widget(paragraph, inner_area);
+        }
+        WizardState::ProjectIdInput(current) => {
+             let text = vec![
+                Line::from(""),
+                Line::from(Span::styled("Enter Google Cloud Project ID", Style::default().fg(WARNING_COLOR).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from("Please enter a valid Project ID (e.g., 'my-project-12345')."),
+                Line::from("This will be saved to ~/.config/aether-bridge/config.json"),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("> "),
+                    Span::styled(current, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled("_", Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::SLOW_BLINK)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled("[Enter] Confirm  [Esc] Quit", Style::default().fg(MUTED_COLOR))),
+            ];
+
+            let paragraph = Paragraph::new(text)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true });
+            frame.render_widget(paragraph, inner_area);
+        }
+
+        WizardState::ConfigureClaude => {
+             let text = vec![
+                Line::from(""),
+                Line::from(Span::styled("Configure Claude Code for Bypass?", Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from("Claude Code has an onboarding wizard that can interfere with AetherBridge."),
+                Line::from("We can automatically configure it to skip the wizard and use AetherBridge."),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("[Y] Yes", Style::default().fg(SUCCESS_COLOR).add_modifier(Modifier::BOLD)),
+                    Span::raw("  Configure Claude Code (Recommended)"),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("[N] No", Style::default().fg(WARNING_COLOR).add_modifier(Modifier::BOLD)),
+                    Span::raw("   Skip configuration"),
+                ]),
+            ];
+
+            let paragraph = Paragraph::new(text)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true });
+            frame.render_widget(paragraph, inner_area);
+        }
+        WizardState::ExportShell(_) => {
+             use common::shell::Shell;
+             let shell_name = Shell::detect().name();
+
+             let text = vec![
+                Line::from(""),
+                Line::from(Span::styled("Export to Shell Configuration?", Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from(format!("We detected that you are using {} shell.", shell_name)),
+                Line::from("Would you like to automatically export GOOGLE_CLOUD_PROJECT in your config?"),
+                Line::from("This allows other tools (like Claude Code) to find your project ID automatically."),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("[Y] Yes", Style::default().fg(SUCCESS_COLOR).add_modifier(Modifier::BOLD)),
+                    Span::raw("  Add to my shell config (Recommended)"),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("[N] No", Style::default().fg(WARNING_COLOR).add_modifier(Modifier::BOLD)),
+                    Span::raw("   Skip this step"),
+                ]),
+            ];
+
+            let paragraph = Paragraph::new(text)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true });
+            frame.render_widget(paragraph, inner_area);
+        }
+        WizardState::Finished => {
+             let text = vec![
+                Line::from(""),
+                Line::from(Span::styled("Setup Complete!", Style::default().fg(SUCCESS_COLOR).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from("Your configuration has been saved."),
+                Line::from("You can now use AetherBridge to connect your AI tools."),
+                Line::from(""),
+                Line::from("Don't forget to [L]ogin with your Google account if you haven't yet."),
+                Line::from(""),
+                Line::from(Span::styled("Press any key to start", Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::SLOW_BLINK))),
+            ];
+
+            let paragraph = Paragraph::new(text)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true });
+            frame.render_widget(paragraph, inner_area);
+        }
     }
 }
 
@@ -80,6 +240,10 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(app.port.to_string(), Style::default().fg(Color::White)),
             Span::styled(" | Host: ", Style::default().fg(MUTED_COLOR)),
             Span::styled(&app.host, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+             Span::raw("  Project: "),
+             Span::styled(app.config.project_id.as_deref().unwrap_or("Not Set"), Style::default().fg(if app.config.project_id.is_some() { SUCCESS_COLOR } else { WARNING_COLOR })),
         ]),
     ];
 
@@ -239,6 +403,11 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         InputMode::Help => {
             Line::from(vec![
                 Span::styled(" Press any key to close help", Style::default().fg(MUTED_COLOR)),
+            ])
+        }
+        InputMode::Wizard(_) => {
+             Line::from(vec![
+                Span::styled(" Setup Wizard ", Style::default().fg(ACCENT_COLOR)),
             ])
         }
     };

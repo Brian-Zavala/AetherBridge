@@ -43,8 +43,8 @@ impl AntigravityModel {
     /// Returns the API model identifier
     pub fn api_id(&self) -> &'static str {
         match self {
-            Self::Gemini3Pro => "gemini-3-pro",
-            Self::Gemini3Flash => "gemini-3-flash",
+            Self::Gemini3Pro => "gemini-3-pro-preview",
+            Self::Gemini3Flash => "gemini-3-flash-preview",
             Self::ClaudeSonnet45 => "claude-sonnet-4.5",
             Self::ClaudeSonnet45Thinking => "claude-sonnet-4.5-thinking",
             Self::ClaudeOpus45Thinking => "claude-opus-4.5-thinking",
@@ -253,7 +253,7 @@ impl AntigravityClient {
             client,
             access_token: Arc::new(RwLock::new(access_token)),
             project_id: Arc::new(RwLock::new(
-                std::env::var("AETHER_PROJECT_ID").ok()
+                std::env::var("GOOGLE_CLOUD_PROJECT").ok()
                     .or(project_id)
                     .unwrap_or_else(|| ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string())
             )),

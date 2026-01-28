@@ -240,8 +240,9 @@ async fn handle_antigravity_request(
 
     tracing::info!("Using account: {} for model {}", account.email, model);
 
-    // Create the Antigravity client
-    let client = match AntigravityClient::new(account.access_token.clone(), None) {
+    // Create the Antigravity client with user's project ID from config
+    let project_id = state.config.project_id.clone();
+    let client = match AntigravityClient::new(account.access_token.clone(), project_id) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to create Antigravity client: {}", e);
@@ -335,6 +336,7 @@ pub async fn messages(
     Json(payload): Json<Value>,
 ) -> impl IntoResponse {
     tracing::info!("Received Anthropic messages request");
+    tracing::info!(">>> PAYLOAD: {:?}", payload); // DEBUG: PROOF OF LIFE
 
     // Check if streaming is requested
     let is_streaming = payload.get("stream")
@@ -386,8 +388,9 @@ pub async fn messages(
 
     tracing::info!("Using account: {} for Anthropic request", account.email);
 
-    // Create Antigravity client
-    let client = match AntigravityClient::new(account.access_token.clone(), None) {
+    // Create Antigravity client with user's project ID from config
+    let project_id = state.config.project_id.clone();
+    let client = match AntigravityClient::new(account.access_token.clone(), project_id.clone()) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to create Antigravity client: {}", e);
@@ -421,8 +424,87 @@ pub async fn messages(
         None
     };
 
-    // Make the API call
-    match client.chat_completion(model, messages, thinking_config).await {
+    // Make the API call with potential spoofing
+    let result = client.chat_completion(model, messages.clone(), thinking_config.clone()).await;
+
+    let api_result = match result {
+        Err(e) => {
+            let error_str = e.to_string();
+            tracing::warn!("Antigravity API Error: '{}'", error_str);
+
+            // Trigger fallback on Rate Limit (429), Forbidden (403 - Quota), or Overloaded (503)
+            if error_str.starts_with("RATE_LIMITED:")
+                || error_str.contains("429")
+                || error_str.contains("403")
+                || error_str.contains("503")
+            {
+                 // Parse retry duration
+                 let parts: Vec<&str> = error_str.splitn(3, ':').collect();
+                 let seconds = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
+                 let until = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
+
+                 // Mark CURRENT account as rate limited
+                 state.account_manager.mark_rate_limited(account.index, until).await;
+                 tracing::warn!("Account {} rate limited. Attempting mitigation strategies...", account.index);
+
+                 // Strategy 1: Spoof on SAME account
+                 let mut spoof_success = false;
+                 let mut final_res = Err(e); // Default to original error
+
+                 if let Some(spoof_model) = get_spoof_model(model) {
+                     tracing::info!("Strategy 1: Spoofing {:?} on same account...", spoof_model);
+                     let spoof_config = adapt_config_for_spoof(&thinking_config, spoof_model);
+                     match client.chat_completion(spoof_model, messages.clone(), spoof_config.clone()).await {
+                         Ok(res) => {
+                             spoof_success = true;
+                             final_res = Ok(res);
+                         },
+                         Err(e2) => {
+                             tracing::warn!("Strategy 1 Failed: {}", e2);
+                             // If this failed, it's likely a project-wide ban. We MUST rotate.
+                         }
+                     }
+                 }
+
+                 if !spoof_success {
+                     // Strategy 2: Rotate Account (Absolute Fallback)
+                     tracing::info!("Strategy 2: Rotating account...");
+                     if let Some(new_account) = state.account_manager.get_available_account().await {
+                         tracing::info!("Switched to account: {}", new_account.email);
+                         if let Ok(new_client) = AntigravityClient::new(new_account.access_token.clone(), project_id.clone()) {
+
+                             // Try Spoof immediately on new account
+                             let target_model = if let Some(spoof) = get_spoof_model(model) { spoof } else { model };
+                             let target_config = if target_model != model {
+                                 adapt_config_for_spoof(&thinking_config, target_model)
+                             } else {
+                                 thinking_config.clone()
+                             };
+
+                             match new_client.chat_completion(target_model, messages, target_config).await {
+                                 Ok(res) => {
+                                     state.account_manager.clear_rate_limit(new_account.index).await;
+                                     final_res = Ok(res);
+                                 },
+                                 Err(e3) => {
+                                     tracing::error!("Strategy 2 Failed: {}", e3);
+                                     final_res = Err(e3);
+                                 }
+                             }
+                         }
+                     } else {
+                         tracing::error!("No alternative accounts available.");
+                     }
+                 }
+                 final_res
+            } else {
+                Err(e)
+            }
+        },
+        Ok(res) => Ok(res),
+    };
+
+    match api_result {
         Ok(response) => {
             state.account_manager.clear_rate_limit(account.index).await;
 
@@ -519,6 +601,36 @@ fn map_anthropic_to_antigravity(model_id: &str) -> AntigravityModel {
     }
 }
 
+/// Returns the Gemini spoof model for a given Anthropic model
+fn get_spoof_model(model: AntigravityModel) -> Option<AntigravityModel> {
+    match model {
+        AntigravityModel::ClaudeOpus45Thinking => Some(AntigravityModel::Gemini3Pro),
+        AntigravityModel::ClaudeSonnet45Thinking | AntigravityModel::ClaudeSonnet45 => Some(AntigravityModel::Gemini3Flash),
+        _ => None,
+    }
+}
+
+/// Adapts thinking configuration when spoofing (e.g., mapping budget to level)
+fn adapt_config_for_spoof(
+    config: &Option<browser_automator::ThinkingConfig>,
+    target_model: AntigravityModel,
+) -> Option<browser_automator::ThinkingConfig> {
+    let mut new_config = config.clone();
+
+    if let Some(ref mut cfg) = new_config {
+        // If switching to Gemini (which uses level) from Claude (which uses budget)
+        if !target_model.is_claude() && cfg.level.is_none() {
+            // Default to "high" for Pro and "medium" for Flash/others if not specified
+            cfg.level = Some(match target_model {
+                AntigravityModel::Gemini3Flash => "medium".to_string(),
+                _ => "high".to_string(),
+            });
+        }
+    }
+
+    new_config
+}
+
 /// Converts Anthropic message format to Antigravity format
 fn convert_anthropic_messages(payload: &Value) -> Vec<AntigravityMessage> {
     let mut messages = Vec::new();
@@ -598,6 +710,7 @@ async fn messages_streaming(
 
     // Clone state for async move
     let account_manager = state.account_manager.clone();
+    let project_id = state.config.project_id.clone();
 
     // Create the stream
     let stream = async_stream::stream! {
@@ -620,8 +733,8 @@ async fn messages_streaming(
 
         tracing::info!("Streaming with account: {}", account.email);
 
-        // Create client
-        let client = match AntigravityClient::new(account.access_token.clone(), None) {
+        // Create client with user's project ID
+        let client = match AntigravityClient::new(account.access_token.clone(), project_id.clone()) {
             Ok(c) => c,
             Err(e) => {
                 let error_event = serde_json::json!({
@@ -675,7 +788,92 @@ async fn messages_streaming(
         yield Ok(Event::default().event("message_start").data(message_start.to_string()));
 
         // Make the actual API call (non-streaming for now - Antigravity doesn't expose SSE)
-        match client.chat_completion(model, messages, thinking_config).await {
+        let result = client.chat_completion(model, messages.clone(), thinking_config.clone()).await;
+
+        let api_result = match result {
+            Err(e) => {
+                let error_str = e.to_string();
+
+                // Trigger fallback on Rate Limit (429), Forbidden (403 - Quota), or Overloaded (503)
+                if error_str.starts_with("RATE_LIMITED:")
+                    || error_str.contains("429")
+                    || error_str.contains("403")
+                    || error_str.contains("503")
+                {
+                     // Parse retry duration
+                     let parts: Vec<&str> = error_str.splitn(3, ':').collect();
+                     let seconds = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
+                     let until = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
+
+                     // Mark CURRENT account as rate limited
+                     account_manager.mark_rate_limited(account.index, until).await;
+                     tracing::warn!("Streaming: Account {} rate limited. Attempting mitigation...", account.index);
+
+                     // Strategy 1: Spoof on SAME account
+                     let mut spoof_success = false;
+                     let mut final_res = Err(e);
+
+                     if let Some(spoof_model) = get_spoof_model(model) {
+                         tracing::warn!("Streaming Strategy 1: Spoofing {:?} on same account...", spoof_model);
+                         let spoof_config = adapt_config_for_spoof(&thinking_config, spoof_model);
+                         match client.chat_completion(spoof_model, messages.clone(), spoof_config.clone()).await {
+                             Ok(res) => {
+                                 spoof_success = true;
+                                 final_res = Ok(res);
+                             },
+                             Err(e2) => {
+                                 tracing::warn!("Streaming Strategy 1 Failed: {}", e2);
+                             }
+                         }
+                     }
+
+                     if !spoof_success {
+                         // Strategy 2: Rotate Account
+                         tracing::warn!("Streaming Strategy 2: Rotating account...");
+                         if let Some(new_account) = account_manager.get_available_account().await {
+                             tracing::info!("Streaming switched to account: {}", new_account.email);
+
+                             // Need to construct new client with the NEW account token
+                             // Note: We need to clone project_id again.
+                             // CAUTION: 'project_id' variable from outer scope might be moved if not careful,
+                             // but it was cloned for 'client' creation earlier. We need to be sure we have it.
+                             // We cloned it at line 737: `project_id.clone()`. The original `project_id` is still available?
+                             // Yes, line 737 used a clone. `project_id` (the local var) is available.
+
+                             if let Ok(new_client) = AntigravityClient::new(new_account.access_token.clone(), project_id.clone()) {
+
+                                 // Try Spoof immediately on new account
+                                 let target_model = if let Some(spoof) = get_spoof_model(model) { spoof } else { model };
+                                 let target_config = if target_model != model {
+                                     adapt_config_for_spoof(&thinking_config, target_model)
+                                 } else {
+                                     thinking_config.clone()
+                                 };
+
+                                 match new_client.chat_completion(target_model, messages, target_config).await {
+                                     Ok(res) => {
+                                         account_manager.clear_rate_limit(new_account.index).await;
+                                         final_res = Ok(res);
+                                     },
+                                     Err(e3) => {
+                                         tracing::error!("Streaming Strategy 2 Failed: {}", e3);
+                                         final_res = Err(e3);
+                                     }
+                                 }
+                             }
+                         } else {
+                             tracing::error!("Streaming: No alternative accounts available.");
+                         }
+                     }
+                     final_res
+                } else {
+                    Err(e)
+                }
+            },
+            Ok(res) => Ok(res),
+        };
+
+        match api_result {
             Ok(response) => {
                 account_manager.clear_rate_limit(account.index).await;
 
