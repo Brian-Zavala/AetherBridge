@@ -246,7 +246,7 @@ impl AntigravityClient {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         // Session Distribution: Randomize session ID to avoid rate limit tracking by client ID
-        let session_id = Uuid::new_v4().to_string();
+        let session_id = Self::generate_session_id();
         if let Ok(val) = HeaderValue::from_str(&session_id) {
             headers.insert("X-Goog-Session-Id", val);
         }
@@ -277,6 +277,11 @@ impl AntigravityClient {
     async fn current_endpoint(&self) -> &'static str {
         let idx = *self.endpoint_index.read().await;
         ANTIGRAVITY_ENDPOINTS.get(idx).copied().unwrap_or(ANTIGRAVITY_ENDPOINTS[0])
+    }
+
+    /// Helper to generate a dynamic session ID for request anonymity
+    fn generate_session_id() -> String {
+        Uuid::new_v4().to_string()
     }
 
     /// Tries the next endpoint in the fallback list
@@ -657,8 +662,10 @@ impl AntigravityClient {
 
                         match serde_json::from_str::<Value>(data) {
                              Ok(value) => {
-                                 // Parse candidates
-                                 if let Some(candidates) = value.get("candidates").and_then(|c| c.as_array()) {
+                                 // Check for response wrapper in stream chunks too
+                                 let root = if let Some(inner) = value.get("response") { inner } else { &value };
+
+                                 if let Some(candidates) = root.get("candidates").and_then(|c| c.as_array()) {
                                      if let Some(first) = candidates.first() {
                                          if let Some(parts) = first.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                                              for part in parts {
@@ -683,8 +690,10 @@ impl AntigravityClient {
                         // Try parsing raw line (maybe no data: prefix?)
                          match serde_json::from_str::<Value>(trimmed) {
                              Ok(value) => {
-                                 // Same parsing logic (refactor if complex, but inline for now is fine)
-                                 if let Some(candidates) = value.get("candidates").and_then(|c| c.as_array()) {
+                                 // Check for response wrapper in stream chunks too
+                                 let root = if let Some(inner) = value.get("response") { inner } else { &value };
+
+                                 if let Some(candidates) = root.get("candidates").and_then(|c| c.as_array()) {
                                      if let Some(first) = candidates.first() {
                                          if let Some(parts) = first.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                                              for part in parts {
