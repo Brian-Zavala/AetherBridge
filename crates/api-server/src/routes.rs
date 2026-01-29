@@ -363,7 +363,7 @@ pub async fn messages(
     tracing::info!("Anthropic model requested: {}", requested_model);
 
     // Map Anthropic model IDs to Antigravity models
-    let model = map_anthropic_to_antigravity(requested_model);
+    let mut model = map_anthropic_to_antigravity(requested_model);
     tracing::info!("Mapped to Antigravity model: {:?}", model);
 
     // Check for extended thinking via anthropic-beta header or thinking field
@@ -376,6 +376,23 @@ pub async fn messages(
         match state.account_manager.get_available_account().await {
             Some(acc) => break acc,
             None => {
+                // Check for Pre-emptive Spoofing (Strategy 0)
+                tracing::info!("Primary model rate limited. Checking Strategy 0 fallback for {:?}", model);
+                if let Some(spoof_model) = get_spoof_model(model) {
+                     tracing::info!("Spoof model available: {:?}", spoof_model);
+                     if let Some(acc) = state.account_manager.get_available_account_ignoring_rate_limit().await {
+                         // Log the pre-emptive switch
+                         tracing::info!("Strategy 0: Ignoring rate limit and using account {} for spoof model {:?}", acc.email, spoof_model);
+                         // Swap model and proceed
+                         model = spoof_model;
+                         break acc;
+                     } else {
+                         tracing::warn!("Strategy 0 Failed: Could not find ANY account (even ignoring rate limits) to try spoofing.");
+                     }
+                } else {
+                    tracing::info!("No spoof model defined for {:?}, skipping Strategy 0.", model);
+                }
+
                 if let Some(wait_time) = state.account_manager.get_min_wait_time().await {
                     let wait_secs = wait_time.as_secs();
                     if wait_secs > 600 {

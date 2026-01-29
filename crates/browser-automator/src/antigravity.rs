@@ -43,11 +43,11 @@ impl AntigravityModel {
     /// Returns the API model identifier
     pub fn api_id(&self) -> &'static str {
         match self {
-            Self::Gemini3Pro => "gemini-3-pro-preview",
-            Self::Gemini3Flash => "gemini-3-flash-preview",
-            Self::ClaudeSonnet45 => "claude-sonnet-4.5",
-            Self::ClaudeSonnet45Thinking => "claude-sonnet-4.5-thinking",
-            Self::ClaudeOpus45Thinking => "claude-opus-4.5-thinking",
+            Self::Gemini3Pro => "gemini-3-pro",
+            Self::Gemini3Flash => "gemini-3-flash",
+            Self::ClaudeSonnet45 => "claude-sonnet-4-5",
+            Self::ClaudeSonnet45Thinking => "claude-sonnet-4-5-thinking",
+            Self::ClaudeOpus45Thinking => "claude-opus-4-5-thinking",
         }
     }
 
@@ -284,48 +284,70 @@ impl AntigravityClient {
         }
     }
 
-    /// Fetches the user's first active project ID to avoid using the shared default
-    async fn fetch_user_project(&self) {
-        // Only fetch if we are currently using the default project
-        let current = self.project_id.read().await;
-        if *current != ANTIGRAVITY_DEFAULT_PROJECT_ID {
-            return;
-        }
-        drop(current);
+    /// Fetches the provisioned project ID (using loadCodeAssist)
+    /// This returns the "Golden Ticket" project ID that has quotas enabled.
+    async fn fetch_provisioned_project_id(&self) {
+        // Only fetch if we are currently using the default project or a manually configured one
+        // that might be invalid. We always try to upgrade to the official one.
+        let current = self.project_id.read().await.clone();
 
-        debug!("Fetching user project list...");
+        debug!("Attempting to discover provisioned project ID...");
         let token = self.access_token.read().await.clone();
-        let url = "https://cloudresourcemanager.googleapis.com/v1/projects";
 
-        match self.client
-            .get(url)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    if let Ok(json) = resp.json::<Value>().await {
-                        if let Some(projects) = json.get("projects").and_then(|p| p.as_array()) {
-                            // Find first ACTIVE project
-                            for p in projects {
-                                if p.get("lifecycleState").and_then(|s| s.as_str()) == Some("ACTIVE") {
-                                    if let Some(id) = p.get("projectId").and_then(|s| s.as_str()) {
-                                        info!("Switched to user project: {}", id);
-                                        *self.project_id.write().await = id.to_string();
-                                        return;
-                                    }
-                                }
-                            }
-                            warn!("No active projects found for user. Staying on default.");
-                        }
-                    }
-                } else {
-                    debug!("Failed to list projects: {}", resp.status());
-                }
-            },
-            Err(e) => debug!("Error listing projects: {}", e),
+        // Try endpoints in order (Prod -> Daily -> Autopush)
+
+
+        for (idx, endpoint) in ANTIGRAVITY_ENDPOINTS.iter().enumerate() {
+             let url = format!("{}/v1internal:loadCodeAssist", endpoint);
+             let body = json!({
+                 "metadata": {
+                     "ideType": "IDE_UNSPECIFIED",
+                     "platform": "PLATFORM_UNSPECIFIED",
+                     "pluginType": "GEMINI"
+                 }
+             });
+
+             match self.client
+                 .post(&url)
+                 .header(AUTHORIZATION, format!("Bearer {}", token))
+                 .json(&body)
+                 .send()
+                 .await
+             {
+                 Ok(resp) => {
+                     if resp.status().is_success() {
+                         if let Ok(json) = resp.json::<Value>().await {
+                             // Check for cloudaicompanionProject (string or object with id)
+                             let extracted_id = if let Some(id_str) = json.get("cloudaicompanionProject").and_then(|v| v.as_str()) {
+                                 Some(id_str.to_string())
+                             } else if let Some(id_str) = json.get("cloudaicompanionProject")
+                                 .and_then(|v| v.get("id"))
+                                 .and_then(|v| v.as_str())
+                             {
+                                 Some(id_str.to_string())
+                             } else {
+                                 None
+                             };
+
+                             if let Some(id) = extracted_id {
+                                 if !id.is_empty() {
+                                     info!("Discovered provisioned project ID: {} (via {})", id, endpoint);
+                                     *self.project_id.write().await = id;
+                                     // IMPORTANT: Set the endpoint index to the one that worked!
+                                     *self.endpoint_index.write().await = idx;
+                                     return;
+                                 }
+                             }
+                         }
+                     } else {
+                         debug!("loadCodeAssist failed at {}: {}", endpoint, resp.status());
+                     }
+                 },
+                 Err(e) => debug!("Error calling loadCodeAssist at {}: {}", endpoint, e),
+             }
         }
+
+        warn!("Failed to discover provisioned project ID. Continuing with: {}", current);
     }
 
     /// Builds the request body for a chat completion
@@ -364,8 +386,19 @@ impl AntigravityClient {
                 } else {
                     // Gemini 3 uses thinkingLevel
                     if let Some(level) = &thinking.level {
+                        let mut effective_level = level.as_str();
+
+                        // Gemini 3 Pro only supports "low" and "high"
+                        if matches!(model, AntigravityModel::Gemini3Pro) {
+                            match effective_level {
+                                "minimal" => effective_level = "low",
+                                "medium" => effective_level = "high",
+                                _ => {}
+                            }
+                        }
+
                         generation_config["thinkingConfig"] = json!({
-                            "thinkingLevel": level,
+                            "thinkingLevel": effective_level,
                             "includeThoughts": thinking.include_thoughts
                         });
                     }
@@ -373,10 +406,25 @@ impl AntigravityClient {
             }
         }
 
+        // Determine the actual model ID string to send
+        let mut api_model_id = model.api_id().to_string();
+
+        if matches!(model, AntigravityModel::Gemini3Pro) {
+            // Gemini 3 Pro requires the tier in the model name (e.g., gemini-3-pro-low)
+            // It does NOT use the bare name like Flash does.
+            let level = thinking.and_then(|t| t.level.as_deref()).unwrap_or("low");
+            let effective_level = match level {
+                "minimal" => "low",
+                "medium" => "high",
+                other => other,
+            };
+            api_model_id = format!("{}-{}", api_model_id, effective_level);
+        }
+
         // Build the full request body
         json!({
             "project": project_id,
-            "model": model.api_id(),
+            "model": api_model_id,
             "request": {
                 "contents": contents,
                 "generationConfig": generation_config,
@@ -392,7 +440,7 @@ impl AntigravityClient {
         thinking: Option<ThinkingConfig>,
     ) -> Result<ChatResponse> {
         // Ensure we have a valid project ID
-        self.fetch_user_project().await;
+        self.fetch_provisioned_project_id().await;
 
         let endpoint = self.current_endpoint().await;
         let url = format!("{}/v1internal:generateContent", endpoint);
@@ -522,7 +570,7 @@ impl AntigravityClient {
         thinking: Option<ThinkingConfig>,
     ) -> Result<impl futures::Stream<Item = Result<StreamChunk>> + Send> {
         // Ensure we have a valid project ID
-        self.fetch_user_project().await;
+        self.fetch_provisioned_project_id().await;
 
         let endpoint = self.current_endpoint().await;
         // Use streamGenerateContent with alt=sse
