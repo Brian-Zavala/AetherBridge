@@ -10,6 +10,7 @@ AetherBridge now proxies requests to Google's Antigravity API using OAuth tokens
 - ✅ SSE streaming support
 - ✅ Model spoofing (claude-3-* → antigravity models)
 - ✅ TUI dashboard with OAuth login flow
+- ✅ Robust Rate Limit Handling (Spoofing, Fallback, Session Distribution)
 
 ---
 
@@ -17,17 +18,17 @@ AetherBridge now proxies requests to Google's Antigravity API using OAuth tokens
 - [x] Test Claude Code CLI with AetherBridge
     - [x] Set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`
     - [x] Run `claude` and verify responses
-    - [/] Test streaming functionality (Basic streaming works, tool use in progress)
-    - [ ] **Verify "Strategy 0" Rate Limit Fallback**: Code implemented to spoof model (e.g., Opus->Gemini) immediately on rate limit, but final robust account selector fix needs verification.
+    - [x] Test streaming functionality (Fixed 400 errors and reliability)
+    - [x] **Verify "Strategy 0" Rate Limit Fallback**: Confirmed working with new fallback logic and spoofing updates.
 - [ ] Implement Tool Use / Function Calling (Critical for Agentic features)
-    - [ ] Handle `tool_use` and `tool_result` content blocks in `/v1/messages`
+    - **Current Status**: Claude tools fail because Antigravity proxy strips tool definitions.
+    - [ ] **Implement Google Search Wrapper**: Create a separate tool execution path using Gemini 3 Flash to perform searches and inject results, bypassing the stripping issue.
     - [ ] Map Anthropic tool definitions to Antigravity (native or via system prompt)
     - [ ] Verify Claude Code can execute tools (bash, glob, etc.) through the bridge
 - [x] Debug and fix any Claude Code compatibility issues
     - [x] Verify SSE event format matches Anthropic spec
-    - [x] Handle edge cases (Fixed 404s by switching to Production endpoint)
-    - [x] Fix authentication conflicts (Now handling OAuth tokens correctly)
-    - [x] Investigate Rate Limits (Identified shared project ID bottleneck; user project required)
+    - [x] Handle edge cases (Fixed 404s, 500s, 400s)
+    - [x] Fix authentication conflicts (OAuth + Session Distribution)
 - [ ] Improve User Onboarding UX (TUI-First Approach)
     - [ ] **Smart Environment Persistence**: TUI detects missing env vars and offers to append exports (`ANTHROPIC_BASE_URL`, `AETHER_PROJECT_ID`) to user's shell config (`.zshrc`/`.bashrc`).
     - [ ] **Interactive Project Setup Wizard**:

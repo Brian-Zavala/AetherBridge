@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, warn, error, info};
+use uuid::Uuid;
 
 // =============================================================================
 // Model Definitions
@@ -244,6 +245,12 @@ impl AntigravityClient {
         headers.insert("Client-Metadata", HeaderValue::from_static(ANTIGRAVITY_CLIENT_METADATA));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
+        // Session Distribution: Randomize session ID to avoid rate limit tracking by client ID
+        let session_id = Uuid::new_v4().to_string();
+        if let Ok(val) = HeaderValue::from_str(&session_id) {
+            headers.insert("X-Goog-Session-Id", val);
+        }
+
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(std::time::Duration::from_secs(3600)) // 1 hour timeout for queuing + long thinking
@@ -376,7 +383,7 @@ impl AntigravityClient {
         if model.supports_thinking() {
             if let Some(thinking) = thinking {
                 if model.is_claude() {
-                    // Claude uses thinkingBudget
+                    // Claude uses thinkingBudget ONLY. Do NOT send thinkingLevel.
                     if let Some(budget) = thinking.budget.or(model.default_thinking_budget()) {
                         generation_config["thinkingConfig"] = json!({
                             "thinkingBudget": budget,
@@ -384,7 +391,7 @@ impl AntigravityClient {
                         });
                     }
                 } else {
-                    // Gemini 3 uses thinkingLevel
+                    // Gemini 3 uses thinkingLevel ONLY. Do NOT send thinkingBudget.
                     if let Some(level) = &thinking.level {
                         let mut effective_level = level.as_str();
 
@@ -452,12 +459,18 @@ impl AntigravityClient {
         debug!("Sending request to {}", url);
         debug!("Request body: {}", serde_json::to_string_pretty(&body)?);
 
-        let response = self.client
+        let mut request = self.client
             .post(&url)
             .header(AUTHORIZATION, format!("Bearer {}", token))
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+
+        // Header Injection: Claude models need specific beta headers for thinking
+        if model.is_claude() {
+             request = request.header("anthropic-beta", "interleaved-thinking-2025-05-14");
+             // Note: OpenCode also mentions prompt-caching headers if used, but we don't support that yet.
+        }
+
+        let response = request.send().await?;
 
         let status = response.status();
 
@@ -500,8 +513,15 @@ impl AntigravityClient {
 
     /// Parses the API response into a ChatResponse
     fn parse_response(&self, raw: Value, model: AntigravityModel) -> Result<ChatResponse> {
+        // Check for "response" wrapper first (sometimes API wraps it)
+        let root = if let Some(inner) = raw.get("response") {
+            inner
+        } else {
+            &raw
+        };
+
         // Extract from candidates[0].content.parts
-        let candidates = raw.get("candidates")
+        let candidates = root.get("candidates")
             .and_then(|c| c.as_array())
             .ok_or_else(|| anyhow!("No candidates in response"))?;
 
@@ -582,12 +602,17 @@ impl AntigravityClient {
 
         debug!("Sending streaming request to {}", url);
 
-        let response = self.client
+        let mut request = self.client
             .post(&url)
             .header(AUTHORIZATION, format!("Bearer {}", token))
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+
+        // Header Injection: Claude models need specific beta headers for thinking
+        if model.is_claude() {
+             request = request.header("anthropic-beta", "interleaved-thinking-2025-05-14");
+        }
+
+        let response = request.send().await?;
 
         let status = response.status();
 

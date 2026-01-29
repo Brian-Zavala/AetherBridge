@@ -655,13 +655,15 @@ fn adapt_config_for_spoof(
     let mut new_config = config.clone();
 
     if let Some(ref mut cfg) = new_config {
-        // If switching to Gemini (which uses level) from Claude (which uses budget)
-        if !target_model.is_claude() && cfg.level.is_none() {
-            // Default to "high" for Pro and "medium" for Flash/others if not specified
-            cfg.level = Some(match target_model {
-                AntigravityModel::Gemini3Flash => "medium".to_string(),
-                _ => "high".to_string(),
-            });
+        // If switching to Gemini (which uses level)
+        if !target_model.is_claude() {
+            // Flash doesn't support "high" or has different constraints. safely force medium.
+            if matches!(target_model, AntigravityModel::Gemini3Flash) {
+                 cfg.level = Some("medium".to_string());
+            } else if cfg.level.is_none() {
+                // Default to "high" for Pro if not specified
+                cfg.level = Some("high".to_string());
+            }
         }
     }
 
@@ -1050,7 +1052,7 @@ async fn messages_streaming(
 
                                  account_manager.clear_rate_limit(account.index).await;
                                  use futures_util::StreamExt;
-                                 let mut output_stream = spoof_stream; // Move ownership
+                                 let output_stream = spoof_stream; // Move ownership
                                  tokio::pin!(output_stream);
 
                                  // Close status block
