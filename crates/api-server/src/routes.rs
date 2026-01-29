@@ -452,9 +452,16 @@ pub async fn messages(
             .and_then(|v| v.as_u64())
             .map(|v| v as u32)
             .or(Some(10000)); // Default budget
+
+        let level = if let Some(b) = budget {
+            if b < 5000 { "low" } else if b < 15000 { "medium" } else { "high" }
+        } else {
+            "low"
+        };
+
         Some(browser_automator::ThinkingConfig {
             budget: budget,
-            level: None,
+            level: Some(level.to_string()),
             include_thoughts: true,
         })
     } else {
@@ -917,16 +924,25 @@ async fn messages_streaming(
         // 5. Convert Messages & Config
         let messages = convert_anthropic_messages(&payload);
         let thinking_config = if thinking_enabled && model.supports_thinking() {
+             // Extract budget from request if specified
              let budget = payload["thinking"]
-                .get("budget_tokens")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32)
-                .or(Some(10000));
-            Some(browser_automator::ThinkingConfig {
-                budget,
-                level: None,
-                include_thoughts: true,
-            })
+                 .get("budget_tokens")
+                 .and_then(|v| v.as_u64())
+                 .map(|v| v as u32)
+                 .or(Some(10000)); // Default budget
+
+             // FIXED: Map budget to level for Gemini fallbacks
+             let level = if let Some(b) = budget {
+                if b < 5000 { "low" } else if b < 15000 { "medium" } else { "high" }
+             } else {
+                "low"
+             };
+
+             Some(browser_automator::ThinkingConfig {
+                 budget: budget,
+                 level: Some(level.to_string()),
+                 include_thoughts: true,
+             })
         } else {
             None
         };

@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, warn, error, info};
 use uuid::Uuid;
+use futures::StreamExt; // Required for stream collection
 
 // =============================================================================
 // Model Definitions
@@ -234,6 +235,8 @@ pub struct AntigravityClient {
     project_id: Arc<RwLock<String>>,
     /// Current endpoint (can fallback)
     endpoint_index: Arc<RwLock<usize>>,
+    /// If true, we will NOT try to overwrite the project_id via auto-discovery
+    force_project_id: bool,
 }
 
 impl AntigravityClient {
@@ -251,20 +254,45 @@ impl AntigravityClient {
             headers.insert("X-Goog-Session-Id", val);
         }
 
+        // 2026-01-26: Critical Header for thinking models
+        headers.insert("anthropic-beta", HeaderValue::from_static("interleaved-thinking-2025-05-14"));
+
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(std::time::Duration::from_secs(3600)) // 1 hour timeout for queuing + long thinking
             .build()?;
 
+        // Determine initial project ID(s) and whether to force it
+        let (raw_project_source, force) = if let Some(p) = project_id {
+            // If user explicitly provided a project ID (not from env), respect it
+            (p, true)
+        } else {
+             (std::env::var("GOOGLE_CLOUD_PROJECT").unwrap_or_else(|_| ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string()), false)
+        };
+
+        // Project ID Rotation: Handle comma-separated list
+        let candidate_ids: Vec<&str> = raw_project_source.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+
+        let selected_project = if candidate_ids.is_empty() {
+            // Should typically not happen if default is set, but fallback just in case
+            ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string()
+        } else {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::thread_rng();
+            let chosen = candidate_ids.choose(&mut rng).unwrap_or(&ANTIGRAVITY_DEFAULT_PROJECT_ID);
+
+            if candidate_ids.len() > 1 {
+                info!("Project ID Rotation: Selected '{}' from pool of {} projects", chosen, candidate_ids.len());
+            }
+            chosen.to_string()
+        };
+
         Ok(Self {
             client,
             access_token: Arc::new(RwLock::new(access_token)),
-            project_id: Arc::new(RwLock::new(
-                std::env::var("GOOGLE_CLOUD_PROJECT").ok()
-                    .or(project_id)
-                    .unwrap_or_else(|| ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string())
-            )),
+            project_id: Arc::new(RwLock::new(selected_project)),
             endpoint_index: Arc::new(RwLock::new(0)),
+            force_project_id: force,
         })
     }
 
@@ -299,8 +327,11 @@ impl AntigravityClient {
     /// Fetches the provisioned project ID (using loadCodeAssist)
     /// This returns the "Golden Ticket" project ID that has quotas enabled.
     async fn fetch_provisioned_project_id(&self) {
-        // Only fetch if we are currently using the default project or a manually configured one
-        // that might be invalid. We always try to upgrade to the official one.
+        // SKIP discovery if user forced a project ID
+        if self.force_project_id {
+            return;
+        }
+
         let current = self.project_id.read().await.clone();
 
         debug!("Attempting to discover provisioned project ID...");
@@ -370,8 +401,12 @@ impl AntigravityClient {
         messages: &[Message],
         thinking: Option<&ThinkingConfig>,
     ) -> Value {
-        // Convert messages to Gemini format (contents array)
-        let contents: Vec<Value> = messages.iter().map(|m| {
+        // Separate system messages from chat content
+        let (system_messages, chat_messages): (Vec<&Message>, Vec<&Message>) = messages.iter()
+            .partition(|m| m.role == "system");
+
+        // Convert chat messages to Gemini format (contents array)
+        let contents: Vec<Value> = chat_messages.iter().map(|m| {
             json!({
                 "role": if m.role == "assistant" { "model" } else { &m.role },
                 "parts": [{"text": &m.content}]
@@ -396,24 +431,18 @@ impl AntigravityClient {
                         });
                     }
                 } else {
-                    // Gemini 3 uses thinkingLevel ONLY. Do NOT send thinkingBudget.
-                    if let Some(level) = &thinking.level {
-                        let mut effective_level = level.as_str();
+                    // FIXED: Gemini 3 requires thinkingLevel ONLY
+                    // We prioritize level if set, otherwise map from budget/default
+                    let effective_level = thinking.level.as_deref().unwrap_or("low");
 
-                        // Gemini 3 Pro only supports "low" and "high"
-                        if matches!(model, AntigravityModel::Gemini3Pro) {
-                            match effective_level {
-                                "minimal" => effective_level = "low",
-                                "medium" => effective_level = "high",
-                                _ => {}
-                            }
-                        }
-
-                        generation_config["thinkingConfig"] = json!({
-                            "thinkingLevel": effective_level,
-                            "includeThoughts": thinking.include_thoughts
-                        });
-                    }
+                    generation_config["thinkingConfig"] = json!({
+                        "thinkingLevel": match effective_level {
+                            "minimal" => "low",
+                            "medium" => "high",
+                            other => other,
+                        },
+                        "includeThoughts": thinking.include_thoughts
+                    });
                 }
             }
         }
@@ -434,86 +463,68 @@ impl AntigravityClient {
         }
 
         // Build the full request body
-        json!({
+        let mut body = json!({
             "project": project_id,
             "model": api_model_id,
             "request": {
                 "contents": contents,
                 "generationConfig": generation_config,
             }
-        })
+        });
+
+        // Add systemInstruction if system messages exist
+        if !system_messages.is_empty() {
+            // Merge all system message contents into one block (common practice)
+            let combined_system_prompt = system_messages.iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<String>>()
+                .join("\n\n");
+
+            if let Some(request_obj) = body.get_mut("request").and_then(|r| r.as_object_mut()) {
+                request_obj.insert("systemInstruction".to_string(), json!({
+                    "parts": [{"text": combined_system_prompt}]
+                }));
+            }
+        }
+
+        body
     }
 
     /// Sends a chat completion request
+    /// FIXED: Now uses chat_completion_stream internally to bypass 500 errors on generateContent
     pub async fn chat_completion(
         &self,
         model: AntigravityModel,
         messages: Vec<Message>,
         thinking: Option<ThinkingConfig>,
     ) -> Result<ChatResponse> {
-        // Ensure we have a valid project ID
-        self.fetch_provisioned_project_id().await;
+        // Use the streaming implementation
+        let stream = self.chat_completion_stream(model.clone(), messages, thinking).await?;
+        let mut stream = Box::pin(stream);
 
-        let endpoint = self.current_endpoint().await;
-        let url = format!("{}/v1internal:generateContent", endpoint);
-        let token = self.access_token.read().await.clone();
-        let project_id = self.project_id.read().await.clone();
+        let mut full_content = String::new();
+        let mut full_thinking = String::new();
+        let mut has_thinking = false;
 
-        let body = self.build_request_body(&project_id, model, &messages, thinking.as_ref());
-
-        debug!("Sending request to {}", url);
-        debug!("Request body: {}", serde_json::to_string_pretty(&body)?);
-
-        let mut request = self.client
-            .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
-            .json(&body);
-
-        // Header Injection: Claude models need specific beta headers for thinking
-        if model.is_claude() {
-             request = request.header("anthropic-beta", "interleaved-thinking-2025-05-14");
-             // Note: OpenCode also mentions prompt-caching headers if used, but we don't support that yet.
-        }
-
-        let response = request.send().await?;
-
-        let status = response.status();
-
-        // Handle rate limiting
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(60);
-
-            // Try to extract more info from body
-            let body_text = response.text().await.unwrap_or_default();
-            warn!("Rate limited. Retry after {} seconds. Body: {}", retry_after, body_text);
-
-            return Err(anyhow!("RATE_LIMITED:{}:{}", retry_after, body_text));
-        }
-
-        // Handle endpoint failures (try fallback)
-        if status.is_server_error() || status == reqwest::StatusCode::BAD_GATEWAY {
-            error!("Server error from {}: {}", endpoint, status);
-            if self.try_next_endpoint().await {
-                // Retry with next endpoint
-                return Box::pin(self.chat_completion(model, messages, thinking)).await;
+        // Collect all chunks
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res?;
+            if chunk.is_thinking {
+                full_thinking.push_str(&chunk.delta);
+                has_thinking = true;
+            } else {
+                full_content.push_str(&chunk.delta);
             }
         }
 
-        if !status.is_success() {
-            let error_text = response.text().await?;
-            error!("API error: {} - {}", status, error_text);
-            return Err(anyhow!("API error {}: {}", status, error_text));
-        }
-
-        let raw: Value = response.json().await?;
-        debug!("Response: {}", serde_json::to_string_pretty(&raw)?);
-
-        self.parse_response(raw, model)
+        // Construct response (usage stats are approximated or missing in stream)
+        Ok(ChatResponse {
+            content: full_content,
+            thinking: if has_thinking { Some(full_thinking) } else { None },
+            model: model.api_id().to_string(),
+            finish_reason: "stop".to_string(),
+            usage: None, // Streaming doesn't always provide final usage
+        })
     }
 
     /// Parses the API response into a ChatResponse
@@ -607,15 +618,13 @@ impl AntigravityClient {
 
         debug!("Sending streaming request to {}", url);
 
-        let mut request = self.client
+        let request = self.client
             .post(&url)
             .header(AUTHORIZATION, format!("Bearer {}", token))
             .json(&body);
 
-        // Header Injection: Claude models need specific beta headers for thinking
-        if model.is_claude() {
-             request = request.header("anthropic-beta", "interleaved-thinking-2025-05-14");
-        }
+        // Header injection is now handled in new() but we can ensure it here too (redundant but safe)
+        // Also removed redundant header injection logic which is now in `new`.
 
         let response = request.send().await?;
 
@@ -627,7 +636,10 @@ impl AntigravityClient {
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                  return Err(anyhow!("RATE_LIMITED:60:{}", error_text));
             }
-            error!("Streaming API error: {} - {}", status, error_text);
+            // 2026-01-28: Handle "Permission denied" specifically
+            if status == reqwest::StatusCode::FORBIDDEN && error_text.contains("generateChat") {
+                 return Err(anyhow!("IAM_PERMISSION_DENIED: The Project ID '{}' likely needs the Gemini API enabled. {}", project_id, error_text));
+            }
             return Err(anyhow!("API error {}: {}", status, error_text));
         }
 

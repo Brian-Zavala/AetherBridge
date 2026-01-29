@@ -54,8 +54,9 @@ pub const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
     ANTIGRAVITY_ENDPOINT_PROD,
 ];
 
-/// Default project ID when Antigravity doesn't return one
-pub const ANTIGRAVITY_DEFAULT_PROJECT_ID: &str = "rising-fact-p41fc";
+/// Default project ID - UPDATED JAN 2026
+/// WARNING: 'rising-fact-p41fc' was revoked. Using a placeholder to force discovery.
+pub const ANTIGRAVITY_DEFAULT_PROJECT_ID: &str = "REQUIRE_USER_PROJECT_ID";
 
 // =============================================================================
 // Request Headers (impersonating Antigravity IDE)

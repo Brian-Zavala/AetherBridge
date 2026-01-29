@@ -20,7 +20,8 @@ AetherBridge now proxies requests to Google's Antigravity API using OAuth tokens
     - [x] Set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`
     - [x] Run `claude` and verify responses
     - [x] Test streaming functionality (Fixed 400 errors and reliability)
-    - [x] **Verify "Strategy 0" Rate Limit Fallback**: Confirmed working with new fallback logic and spoofing updates.
+    - [x] **Verify "Strategy 0" Rate Limit Fallback**: Confirmed working. `Gemini3Flash` now self-spoofs to trigger session rotation on 429s.
+    - [x] **Verify Thinking Config**: Fixed 400 Bad Request by mapping Anthropic budgets to Gemini thinking levels.
 - [ ] Implement Tool Use / Function Calling (Critical for Agentic features)
     - **Current Status**: Claude tools fail because Antigravity proxy strips tool definitions.
     - [ ] **Implement Google Search Wrapper**: Create a separate tool execution path using Gemini 3 Flash to perform searches and inject results, bypassing the stripping issue.

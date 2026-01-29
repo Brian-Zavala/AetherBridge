@@ -41,9 +41,11 @@
     - [x] Cross-platform installation instructions
     - [x] Kuse Cowork integration guide
     - [x] Environment variable reference table
-    - [x] Troubleshooting per-platform guides
-
-## Ratatui TUI Implementation (Phase 5)
+    - [x] Jan 2026 Reliability Updates
+    - [x] **Thinking Config Fix (400)**: Mapped `budget_tokens` to `thinkingLevel` ("low", "medium", "high") for Gemini 3 models in `routes.rs`.
+    - [x] **Strict Thinking Schema**: Enforced strict separation of `thinkingBudget` (Claude) and `thinkingLevel` (Gemini) in `antigravity.rs`.
+    - [x] **Rate Limit Self-Healing (429)**: Enabled `Gemini3Flash` to spoof itself, forcing session rotation (Strategy 0) when rate limited.
+    - [x] **Project ID Rotation**: Implemented random selection from comma-separated `GOOGLE_CLOUD_PROJECT` env var.
 - [x] Create `crates/tui` Crate
     - [x] `App` struct with async event loop
     - [x] `crossterm` backend integration

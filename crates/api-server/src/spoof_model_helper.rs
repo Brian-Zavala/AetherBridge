@@ -6,6 +6,8 @@ fn get_spoof_model(model: AntigravityModel) -> Option<AntigravityModel> {
         AntigravityModel::ClaudeSonnet45Thinking | AntigravityModel::ClaudeSonnet45 => Some(AntigravityModel::Gemini3Flash),
         // Allow Pro -> Flash fallback
         AntigravityModel::Gemini3Pro => Some(AntigravityModel::Gemini3Flash),
-        _ => None,
+        // Self-Healing: Flash -> Flash (triggers rate limit bypass logic)
+        AntigravityModel::Gemini3Flash => Some(AntigravityModel::Gemini3Flash),
+        _ => Some(AntigravityModel::Gemini3Flash),
     }
 }

@@ -15,6 +15,7 @@ futures = "0.3"
 headless_chrome = "1.0.20"
 image = "0.25.9"
 ocrs = "0.12.0"
+rand = "0.8"
 reqwest = { version = "0.12.12", features = ["json", "cookies", "stream"] }
 rten = "0.13.1"
 rusqlite = { version = "0.33", features = ["bundled"] }

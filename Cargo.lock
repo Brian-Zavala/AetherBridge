@@ -643,6 +643,7 @@ dependencies = [
  "image",
  "oauth",
  "ocrs",
+ "rand 0.8.5",
  "reqwest",
  "rten 0.13.1",
  "rusqlite",
