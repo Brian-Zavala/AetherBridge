@@ -11,6 +11,7 @@ AetherBridge now proxies requests to Google's Antigravity API using OAuth tokens
 - ✅ Model spoofing (claude-3-* → antigravity models)
 - ✅ TUI dashboard with OAuth login flow
 - ✅ Robust Rate Limit Handling (Spoofing, Fallback, Session Distribution)
+- ✅ Reliability Fixes (Header Injection for Thinking models, JSON Parsing Fixes)
 
 ---
 

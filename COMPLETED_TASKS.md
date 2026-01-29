@@ -135,13 +135,13 @@
         - Sonnet 4.5 -> `gemini-3-flash-preview`
     - [x] **Model ID Verification**: Updated to confirmed Cloud Code Preview IDs (`gemini-3-pro-preview`, `gemini-3-flash-preview`).
 
-## Reliability & Integration Fixes (2026-01-28)
-- [x] **Critical "Silent" Failure Fixes**
-    - [x] Fixed JSON parsing mismatch where nested `response` object caused 500 errors on successful requests.
-- [x] **Improved Rate Limit Resilience**
-    - [x] **Pro -> Flash Fallback**: Enabled `Gemini3Pro` to fall back to `Gemini3Flash` when Pro quota is exhausted.
-    - [x] **Session Distribution**: Implemented random `X-Goog-Session-Id` generation per request to prevent client-ID based rate limiting.
-- [x] **Streaming & Config Stability**
-    - [x] **Streaming 400 Fix**: Fixed `INVALID_ARGUMENT` errors by sanitizing `thinkingConfig` when falling back to Flash (level-based vs budget-based).
-    - [x] **Header Injection**: Added `anthropic-beta: interleaved-thinking-2025-05-14` header for Claude models to ensure proper proxy behavior.
-    - [x] **Strict Config Sanitization**: Enforced strict separation of `thinkingBudget` (Claude) and `thinkingLevel` (Gemini) params.
+## Architectural Refactorings & Reliability (2026-01-28)
+- [x] **Robust JSON Parsing & Header Injection**
+    - [x] **Fixed "Silent" 500 Errors**: Implemented robust parsing for Sandbox API's nested `{ "response": { ... } }` structure.
+    - [x] **Header Injection**: Automatically injecting `anthropic-beta: interleaved-thinking-2025-05-14` for Claude models to prevent 400 Invalid Argument errors.
+    - [x] **Session Anonymity (PID Offset)**: Implemented random `X-Goog-Session-Id` generation per request to prevent client fingerprinting and rate-limit throttling.
+- [x] **Cascading Model Fallback**
+    - [x] **Dead-End Fix**: Explicitly enabled `Gemini3Pro` -> `Gemini3Flash` fallback to survive Pro quota exhaustion.
+    - [x] **Strict Config Sanitization**: Enforced separation of `thinkingBudget` (Claude) and `thinkingLevel` (Gemini) during fallback to prevent parameter validation errors.
+- [x] **Infrastructure Verification**
+    - [x] **Endpoint Priority**: Configuration confirmed to prioritize Daily (Sandbox) -> Autopush -> Production.
