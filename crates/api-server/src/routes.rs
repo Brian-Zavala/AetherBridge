@@ -1014,9 +1014,9 @@ async fn messages_streaming(
                     if let Some(spoof_model) = get_spoof_model(model) {
                          tracing::info!("Spoof model available: {:?}", spoof_model);
                           if let Some(acc) = account_manager.get_available_account_ignoring_rate_limit().await {
-                              // Log the pre-emptive switch
-                              tracing::info!("Strategy 0: Ignoring rate limit and using account {} for spoof model {:?}", acc.email, spoof_model);
-                              let msg = format!("> Primary model rate limited. Strategy 0: Pre-emptive Spoofing {:?} on account {}...\n", spoof_model, acc.email);
+                              // Log the pre-emptive switch with clear messaging about which model is rate limited
+                              tracing::info!("Strategy 0: {} is rate limited. Spoofing to {} on account {}", model.display_name(), spoof_model.display_name(), acc.email);
+                              let msg = format!("> ⚠️  {} is currently rate limited.\n> 🔄  Switching to {} (fallback model) on account {}...\n", model.display_name(), spoof_model.display_name(), acc.email);
                               let delta = serde_json::json!({
                                    "type": "content_block_delta",
                                    "index": status_block_index,
@@ -1337,7 +1337,7 @@ async fn messages_streaming(
                                status_block_open = true;
                            }
                            
-                           let msg = format!("\n> Rate limit hit. Fallback Strategy 1: Spoofing {:?} on same account...\n", spoof_model);
+                           let msg = format!("\n> ⚠️  Rate limit hit while using {}.\n> 🔄  Fallback Strategy 1: Switching to {} on same account...\n", model.display_name(), spoof_model.display_name());
                           let delta = serde_json::json!({
                                "type": "content_block_delta",
                                "index": if status_block_open { status_block_index } else { block_index },
