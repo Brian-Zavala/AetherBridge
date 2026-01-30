@@ -1319,14 +1319,18 @@ async fn messages_streaming(
                      let until = chrono::Utc::now() + chrono::Duration::seconds(effective_seconds as i64);
                      account_manager.mark_rate_limited(account.index, ModelFamily::from_model_id(&model.api_id().to_string()), until).await;
 
-                      // Strategy 1: Spoofing Fallback
+                       // Strategy 1: Spoofing Fallback
                        if let Some(spoof_model) = get_spoof_model(model) {
                            // Mark that we used a fallback strategy
                            used_fallback = true;
                            
-                           // Check if status block is still open - if not, start a new block for error messages
-                           if !status_block_open {
-                               // Start a new status block since the original is closed
+                           // Determine which block index to use for fallback status messages
+                           // If original status block is closed, we need to open a new one
+                           let fallback_status_index = if status_block_open {
+                               // Use the original status block
+                               status_block_index
+                           } else {
+                               // Open a new status block since the original is closed
                                block_index += 1;
                                let block_start = serde_json::json!({
                                    "type": "content_block_start",
@@ -1334,16 +1338,16 @@ async fn messages_streaming(
                                    "content_block": { "type": "text", "text": "" }
                                });
                                yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
-                               status_block_open = true;
-                           }
+                               block_index // Use the new block index
+                           };
                            
                            let msg = format!("\n> ⚠️  Rate limit hit while using {}.\n> 🔄  Fallback Strategy 1: Switching to {} on same account...\n", model.display_name(), spoof_model.display_name());
-                          let delta = serde_json::json!({
-                               "type": "content_block_delta",
-                               "index": if status_block_open { status_block_index } else { block_index },
-                               "delta": { "type": "text_delta", "text": msg }
-                          });
-                          yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+                           let delta = serde_json::json!({
+                                "type": "content_block_delta",
+                                "index": fallback_status_index,
+                                "delta": { "type": "text_delta", "text": msg }
+                           });
+                           yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
 
                           // Adapt config and retry
                           let spoof_config = adapt_config_for_spoof(&thinking_config, spoof_model);
@@ -1360,12 +1364,9 @@ async fn messages_streaming(
                                   let output_stream = spoof_stream; // Move ownership
                                   tokio::pin!(output_stream);
 
-                                   // Close status block if it's still open
-                                   if status_block_open {
-                                       let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
-                                       yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
-                                       // status_block_open not needed after this point in success path
-                                   }
+                                    // Close the status block we used for fallback messages
+                                    let block_stop = serde_json::json!({ "type": "content_block_stop", "index": fallback_status_index });
+                                    yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
 
                                  // Start text block
                                  let mut text_index = block_index + 1; // Increment for new block
