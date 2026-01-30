@@ -9,6 +9,8 @@ use futures_util::stream::Stream;
 use std::convert::Infallible;
 
 use crate::state::AppState;
+use crate::session_recovery::{recover_session, is_recoverable_error, format_recovery_summary};
+use oauth::accounts::ModelFamily;
 
 /// Health check / welcome page at root
 pub async fn health_check() -> Html<&'static str> {
@@ -283,7 +285,7 @@ async fn handle_antigravity_request(
             Some(acc) => break acc,
             None => {
                 // Check wait time
-                if let Some(wait_time) = state.account_manager.get_min_wait_time().await {
+                if let Some(wait_time) = state.account_manager.get_min_wait_time_for_model(&model_id.to_string()).await {
                     let wait_secs = wait_time.as_secs();
                     if wait_secs > 600 { // Cap wait time at 10 minutes (claude-code-router default timeout is 1h)
                          tracing::warn!("All accounts rate limited. Wait time {}s too long.", wait_secs);
@@ -349,7 +351,7 @@ async fn handle_antigravity_request(
     match client.chat_completion(model, messages, None, tools).await {
         Ok(response) => {
             // Clear rate limit on success
-            state.account_manager.clear_rate_limit(account.index).await;
+            state.account_manager.clear_rate_limit(account.index, ModelFamily::from_model_id(&model.api_id().to_string())).await;
 
             let usage = response.usage.as_ref();
             Json(serde_json::json!({
@@ -390,7 +392,7 @@ async fn handle_antigravity_request(
                 
                 let until = chrono::Utc::now() + chrono::Duration::seconds(effective_seconds as i64);
 
-                state.account_manager.mark_rate_limited(account.index, until).await;
+                state.account_manager.mark_rate_limited(account.index, ModelFamily::from_model_id(&model.api_id().to_string()), until).await;
 
                 let error_type = if is_capacity { "capacity_error" } else { "rate_limit_error" };
                 tracing::warn!("Account {} {} for {} seconds", account.email, error_type, effective_seconds);
@@ -468,7 +470,7 @@ pub async fn messages(
                     tracing::info!("No spoof model defined for {:?}, skipping Strategy 0.", model);
                 }
 
-                if let Some(wait_time) = state.account_manager.get_min_wait_time().await {
+                if let Some(wait_time) = state.account_manager.get_min_wait_time_for_model(&requested_model).await {
                     let wait_secs = wait_time.as_secs();
                     if wait_secs > 600 {
                          tracing::warn!("All accounts rate limited. Wait time {}s too long.", wait_secs);
@@ -553,18 +555,35 @@ pub async fn messages(
     // Track if we used a fallback strategy (don't clear rate limit if we did)
     let mut used_fallback = false;
 
-    let api_result = match result {
-        Err(e) => {
-            let error_str = e.to_string();
-            tracing::warn!("Antigravity API Error: '{}'", error_str);
+     let api_result = match result {
+         Err(e) => {
+             let error_str = e.to_string();
+             tracing::warn!("Antigravity API Error: '{}'", error_str);
 
-            // Trigger fallback on Rate Limit (429), Capacity (503/529), Forbidden (403 - Quota)
-            if error_str.starts_with("RATE_LIMITED:")
-                || error_str.starts_with("CAPACITY_ERROR:")
-                || error_str.contains("429")
-                || error_str.contains("503")
-                || error_str.contains("529")
-            {
+             // Check if this is a recoverable session error (tool_use without tool_result, etc.)
+             if is_recoverable_error(&error_str) {
+                 tracing::warn!("Recoverable session error detected: {}. Attempting recovery and retry...", error_str);
+                 
+                 // Re-convert messages with session recovery applied
+                 let recovered_messages = convert_anthropic_messages(&payload);
+                 
+                 // Retry the request with recovered messages
+                 match client.chat_completion(model, recovered_messages, thinking_config.clone(), tools.clone()).await {
+                     Ok(res) => {
+                         tracing::info!("Session recovery retry succeeded!");
+                         Ok(res)
+                     }
+                     Err(e2) => {
+                         tracing::error!("Session recovery retry failed: {}", e2);
+                         Err(e2)
+                     }
+                 }
+             } else if error_str.starts_with("RATE_LIMITED:")
+                 || error_str.starts_with("CAPACITY_ERROR:")
+                 || error_str.contains("429")
+                 || error_str.contains("503")
+                 || error_str.contains("529")
+             {
                  used_fallback = true; // Mark that we're using fallback strategies
                  
                  // Parse retry duration from RATE_LIMITED:seconds:error or CAPACITY_ERROR:seconds:error
@@ -582,9 +601,9 @@ pub async fn messages(
                  
                  let until = chrono::Utc::now() + chrono::Duration::seconds(effective_seconds as i64);
 
-                 // Mark CURRENT account as rate limited
-                 state.account_manager.mark_rate_limited(account.index, until).await;
-                 tracing::warn!("Account {} rate limited. Attempting mitigation strategies...", account.index);
+                  // Mark CURRENT account as rate limited
+                  state.account_manager.mark_rate_limited(account.index, ModelFamily::from_model_id(&model.api_id().to_string()), until).await;
+                  tracing::warn!("Account {} rate limited. Attempting mitigation strategies...", account.index);
 
                  // Strategy 1: Spoof on SAME account
                  let mut spoof_success = false;
@@ -694,7 +713,7 @@ pub async fn messages(
         Ok(response) => {
             // Only clear rate limit if the PRIMARY request succeeded (not fallback)
             if !used_fallback {
-                state.account_manager.clear_rate_limit(account.index).await;
+                state.account_manager.clear_rate_limit(account.index, ModelFamily::from_model_id(&model.api_id().to_string())).await;
             }
 
             // Build content blocks (Anthropic format)
@@ -748,7 +767,7 @@ pub async fn messages(
                 
                 let until = chrono::Utc::now() + chrono::Duration::seconds(effective_seconds as i64);
 
-                state.account_manager.mark_rate_limited(account.index, until).await;
+                state.account_manager.mark_rate_limited(account.index, ModelFamily::from_model_id(&model.api_id().to_string()), until).await;
                 let error_type = if is_capacity { "capacity_error" } else { "rate_limit_error" };
                 tracing::warn!("Account {} {} for {} seconds", account.email, error_type, effective_seconds);
 
@@ -837,8 +856,8 @@ fn convert_anthropic_messages(payload: &Value) -> Vec<AntigravityMessage> {
     let mut messages = Vec::new();
 
     // Handle system prompt
-    if let Some(system) = payload.get("system") {
-        let system_text = if let Some(s) = system.as_str() {
+    let system_text = if let Some(system) = payload.get("system") {
+        if let Some(s) = system.as_str() {
             s.to_string()
         } else if let Some(arr) = system.as_array() {
             // System can be array of content blocks
@@ -848,46 +867,61 @@ fn convert_anthropic_messages(payload: &Value) -> Vec<AntigravityMessage> {
                 .join("\n")
         } else {
             String::new()
-        };
-
-        if !system_text.is_empty() {
-            messages.push(AntigravityMessage {
-                role: "system".to_string(),
-                content: system_text,
-            });
         }
-    }
+    } else {
+        String::new()
+    };
 
     // Handle conversation messages
+    let mut conversation_messages: Vec<Value> = Vec::new();
     if let Some(msgs) = payload.get("messages").and_then(|m| m.as_array()) {
-        for msg in msgs {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        conversation_messages = msgs.clone();
+    }
 
-            // Content can be string or array of content blocks
-            let content = if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
-                text.to_string()
-            } else if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
-                // Extract text from content blocks
-                blocks.iter()
-                    .filter_map(|block| {
-                        if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            block.get("text").and_then(|t| t.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                String::new()
-            };
+    // Apply session recovery to fix corrupted conversation states
+    // This handles: tool_use without tool_result, thinking block order issues
+    let recovery_result = recover_session(&conversation_messages);
+    if recovery_result.was_recovered {
+        tracing::info!("{}", format_recovery_summary(&recovery_result));
+        conversation_messages = recovery_result.messages;
+    }
 
-            if !content.is_empty() {
-                messages.push(AntigravityMessage {
-                    role: role.to_string(),
-                    content,
-                });
-            }
+    // Add system message if present
+    if !system_text.is_empty() {
+        messages.push(AntigravityMessage {
+            role: "system".to_string(),
+            content: system_text,
+        });
+    }
+
+    // Convert recovered messages to Antigravity format
+    for msg in conversation_messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+
+        // Content can be string or array of content blocks
+        let content = if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+            text.to_string()
+        } else if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
+            // Extract text from content blocks
+            blocks.iter()
+                .filter_map(|block| {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        block.get("text").and_then(|t| t.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::new()
+        };
+
+        if !content.is_empty() {
+            messages.push(AntigravityMessage {
+                role: role.to_string(),
+                content,
+            });
         }
     }
 
@@ -991,7 +1025,7 @@ async fn messages_streaming(
                         tracing::info!("No spoof model defined for {:?}, skipping Strategy 0.", model);
                     }
 
-                    if let Some(wait_time) = account_manager.get_min_wait_time().await {
+                    if let Some(wait_time) = account_manager.get_min_wait_time_for_model(&requested_model).await {
                         let wait_secs = wait_time.as_secs();
                         if wait_secs > 600 {
                             // Close status block
@@ -1112,7 +1146,7 @@ async fn messages_streaming(
 
         match result {
             Ok(output_stream) => { // Removed mut here, pin! handles it
-                 account_manager.clear_rate_limit(account.index).await;
+                 account_manager.clear_rate_limit(account.index, ModelFamily::from_model_id(&model.api_id().to_string())).await;
 
                  use futures_util::StreamExt;
                  // Pin the stream so we can call next()
@@ -1262,7 +1296,7 @@ async fn messages_streaming(
                      };
                      
                      let until = chrono::Utc::now() + chrono::Duration::seconds(effective_seconds as i64);
-                     account_manager.mark_rate_limited(account.index, until).await;
+                     account_manager.mark_rate_limited(account.index, ModelFamily::from_model_id(&model.api_id().to_string()), until).await;
 
                      // Strategy 1: Spoofing Fallback
                      if let Some(spoof_model) = get_spoof_model(model) {

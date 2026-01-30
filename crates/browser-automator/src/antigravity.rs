@@ -291,8 +291,8 @@ pub struct RateLimitError {
 
 /// Client for Google's Cloud Code Assist (Antigravity) API
 pub struct AntigravityClient {
-    /// HTTP client
-    client: reqwest::Client,
+    /// HTTP client (wrapped in RwLock for dynamic header updates)
+    client: Arc<RwLock<reqwest::Client>>,
     /// Current access token
     access_token: Arc<RwLock<String>>,
     /// Project ID for API calls
@@ -376,7 +376,7 @@ impl AntigravityClient {
         };
 
         Ok(Self {
-            client,
+            client: Arc::new(RwLock::new(client)),
             access_token: Arc::new(RwLock::new(access_token)),
             project_id: Arc::new(RwLock::new(selected_project)),
             endpoint_index: Arc::new(RwLock::new(0)),
@@ -467,10 +467,8 @@ impl AntigravityClient {
             .timeout(std::time::Duration::from_secs(3600))
             .build()?;
         
-        // Update the client
-        // Note: This is a bit tricky since client is not behind RwLock
-        // We need to use interior mutability or redesign
-        // For now, we'll use a different approach - see below
+        // Update the client through the RwLock
+        *self.client.write().await = new_client;
         
         Ok(())
     }
@@ -529,7 +527,7 @@ impl AntigravityClient {
                  }
              });
 
-             match self.client
+             match self.client.read().await
                  .post(&url)
                  .header(AUTHORIZATION, format!("Bearer {}", token))
                  .json(&body)
@@ -586,16 +584,14 @@ impl AntigravityClient {
             .partition(|m| m.role == "system");
 
         // Convert chat messages to Gemini format (contents array)
-        // CRITICAL: Strip thinking blocks to prevent signature corruption
+        // CRITICAL: Strip thinking blocks from ALL messages to prevent signature corruption
+        // Thinking blocks contain signatures that become invalid when replayed.
         // See: https://github.com/NoeFabris/opencode-antigravity-auth/blob/main/docs/ARCHITECTURE.md
         let contents: Vec<Value> = chat_messages.iter().map(|m| {
             let role = if m.role == "assistant" { "model" } else { &m.role };
-            // For assistant messages, strip any thinking content markers
-            let content = if m.role == "assistant" {
-                Self::strip_thinking_content(&m.content)
-            } else {
-                m.content.clone()
-            };
+            // Strip thinking content from ALL messages (not just assistant)
+            // This prevents "Invalid thinking signature" errors
+            let content = Self::strip_thinking_content(&m.content);
             json!({
                 "role": role,
                 "parts": [{"text": content}]
@@ -670,8 +666,9 @@ impl AntigravityClient {
         // Add systemInstruction if system messages exist
         if !system_messages.is_empty() {
             // Merge all system message contents into one block (common practice)
+            // CRITICAL: Also strip thinking blocks from system messages
             let combined_system_prompt = system_messages.iter()
-                .map(|m| m.content.clone())
+                .map(|m| Self::strip_thinking_content(&m.content))
                 .collect::<Vec<String>>()
                 .join("\n\n");
 
@@ -919,7 +916,7 @@ impl AntigravityClient {
             tokio::time::sleep(tokio::time::Duration::from_millis(jitter_ms)).await;
         }
 
-        let request = self.client
+        let request = self.client.read().await
             .post(&url)
             .header(AUTHORIZATION, format!("Bearer {}", token))
             .json(&body);

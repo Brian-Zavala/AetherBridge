@@ -5,6 +5,7 @@
 
 pub mod routes;
 pub mod server;
+pub mod session_recovery;
 pub mod state;
 
 pub use server::{create_router, start_server, run_server_blocking, ServerHandle};
