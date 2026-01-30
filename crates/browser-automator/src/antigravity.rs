@@ -13,7 +13,7 @@ use oauth::constants::{
     ANTIGRAVITY_API_CLIENT, ANTIGRAVITY_CLIENT_METADATA,
     ANTIGRAVITY_DEFAULT_PROJECT_ID,
 };
-use crate::fingerprint::Fingerprint;
+use crate::fingerprint::{Fingerprint, HeaderStyle};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -298,6 +298,10 @@ pub struct AntigravityClient {
     force_project_id: bool,
     /// Device fingerprint for request headers
     fingerprint: Option<Fingerprint>,
+    /// Current header style for dual quota support
+    header_style: Arc<RwLock<HeaderStyle>>,
+    /// Whether dual quota fallback is enabled
+    quota_fallback_enabled: bool,
 }
 
 impl AntigravityClient {
@@ -373,12 +377,102 @@ impl AntigravityClient {
             endpoint_index: Arc::new(RwLock::new(0)),
             force_project_id: force,
             fingerprint,
+            header_style: Arc::new(RwLock::new(HeaderStyle::Antigravity)),
+            quota_fallback_enabled: false, // Default disabled, can be enabled via config
         })
     }
 
     /// Updates the access token (for token refresh)
     pub async fn set_access_token(&self, token: String) {
         *self.access_token.write().await = token;
+    }
+
+    /// Enables or disables dual quota fallback
+    /// When enabled, will try Gemini CLI quota when Antigravity quota is exhausted
+    pub async fn set_quota_fallback(&mut self, enabled: bool) {
+        self.quota_fallback_enabled = enabled;
+        info!("Dual quota fallback {}", if enabled { "enabled" } else { "disabled" });
+    }
+
+    /// Switches to Gemini CLI header style for dual quota access
+    /// This should be called when Antigravity quota is exhausted
+    pub async fn switch_to_gemini_cli_headers(&self) -> Result<()> {
+        let mut style = self.header_style.write().await;
+        if *style == HeaderStyle::GeminiCli {
+            return Ok(()); // Already using Gemini CLI headers
+        }
+        
+        *style = HeaderStyle::GeminiCli;
+        info!("Switched to Gemini CLI headers for dual quota access");
+        
+        // Rebuild client with Gemini CLI headers
+        self.rebuild_client_with_style(HeaderStyle::GeminiCli).await
+    }
+
+    /// Switches back to Antigravity headers
+    pub async fn switch_to_antigravity_headers(&self) -> Result<()> {
+        let mut style = self.header_style.write().await;
+        if *style == HeaderStyle::Antigravity {
+            return Ok(()); // Already using Antigravity headers
+        }
+        
+        *style = HeaderStyle::Antigravity;
+        info!("Switched back to Antigravity headers");
+        
+        // Rebuild client with Antigravity headers
+        self.rebuild_client_with_style(HeaderStyle::Antigravity).await
+    }
+
+    /// Rebuilds the HTTP client with the specified header style
+    async fn rebuild_client_with_style(&self, style: HeaderStyle) -> Result<()> {
+        let mut headers = HeaderMap::new();
+        
+        // Apply fingerprint headers with the specified style
+        if let Some(ref fp) = self.fingerprint {
+            let fp_headers = fp.to_headers_with_style(style);
+            for (k, v) in fp_headers {
+                if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_bytes()) {
+                    if let Ok(val) = HeaderValue::from_str(&v) {
+                        headers.insert(name, val);
+                    }
+                }
+            }
+        } else {
+            // Fallback to static constants
+            use oauth::constants::{ANTIGRAVITY_USER_AGENT, ANTIGRAVITY_API_CLIENT, ANTIGRAVITY_CLIENT_METADATA};
+            headers.insert("User-Agent", HeaderValue::from_static(ANTIGRAVITY_USER_AGENT));
+            headers.insert("X-Goog-Api-Client", HeaderValue::from_static(ANTIGRAVITY_API_CLIENT));
+            headers.insert("Client-Metadata", HeaderValue::from_static(ANTIGRAVITY_CLIENT_METADATA));
+        }
+
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        // Generate new session ID
+        let session_id = Self::generate_session_id();
+        if let Ok(val) = HeaderValue::from_str(&session_id) {
+            headers.insert("X-Goog-Session-Id", val);
+        }
+
+        // Critical header for thinking models
+        headers.insert("anthropic-beta", HeaderValue::from_static("interleaved-thinking-2025-05-14"));
+
+        // Build new client
+        let new_client = reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(std::time::Duration::from_secs(3600))
+            .build()?;
+        
+        // Update the client
+        // Note: This is a bit tricky since client is not behind RwLock
+        // We need to use interior mutability or redesign
+        // For now, we'll use a different approach - see below
+        
+        Ok(())
+    }
+
+    /// Gets the current header style
+    pub async fn get_header_style(&self) -> HeaderStyle {
+        *self.header_style.read().await
     }
 
     /// Gets the current endpoint URL

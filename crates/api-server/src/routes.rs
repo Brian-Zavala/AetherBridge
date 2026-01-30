@@ -550,6 +550,9 @@ pub async fn messages(
     // Make the API call with potential spoofing
     let result = client.chat_completion(model, messages.clone(), thinking_config.clone(), tools.clone()).await;
 
+    // Track if we used a fallback strategy (don't clear rate limit if we did)
+    let mut used_fallback = false;
+
     let api_result = match result {
         Err(e) => {
             let error_str = e.to_string();
@@ -562,6 +565,8 @@ pub async fn messages(
                 || error_str.contains("503")
                 || error_str.contains("529")
             {
+                 used_fallback = true; // Mark that we're using fallback strategies
+                 
                  // Parse retry duration from RATE_LIMITED:seconds:error or CAPACITY_ERROR:seconds:error
                  let parts: Vec<&str> = error_str.splitn(3, ':').collect();
                  let seconds = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
@@ -615,16 +620,17 @@ pub async fn messages(
                                  thinking_config.clone()
                              };
 
-                             match new_client.chat_completion(target_model, messages, target_config, tools.clone()).await {
-                                 Ok(res) => {
-                                     state.account_manager.clear_rate_limit(new_account.index).await;
-                                     final_res = Ok(res);
-                                 },
-                                 Err(e3) => {
-                                     tracing::error!("Strategy 2 Failed: {}", e3);
-                                     final_res = Err(e3);
-                                 }
-                             }
+                              match new_client.chat_completion(target_model, messages, target_config, tools.clone()).await {
+                                  Ok(res) => {
+                                      // NOTE: Don't clear rate limit on original account
+                                      // The primary model is still rate-limited, we just used a fallback
+                                      final_res = Ok(res);
+                                  },
+                                  Err(e3) => {
+                                      tracing::error!("Strategy 2 Failed: {}", e3);
+                                      final_res = Err(e3);
+                                  }
+                              }
                          }
                      } else {
                          tracing::error!("No alternative accounts available.");
@@ -640,7 +646,10 @@ pub async fn messages(
 
     match api_result {
         Ok(response) => {
-            state.account_manager.clear_rate_limit(account.index).await;
+            // Only clear rate limit if the PRIMARY request succeeded (not fallback)
+            if !used_fallback {
+                state.account_manager.clear_rate_limit(account.index).await;
+            }
 
             // Build content blocks (Anthropic format)
             let mut content_blocks = Vec::new();
@@ -1221,14 +1230,16 @@ async fn messages_streaming(
 
                          // Adapt config and retry
                          let spoof_config = adapt_config_for_spoof(&thinking_config, spoof_model);
-                         match client.chat_completion_stream(spoof_model, messages.clone(), spoof_config.clone(), tools.clone()).await {
-                             Ok(spoof_stream) => {
-                                 // SUCCESS: Reuse the stream handling logic
-                                 // We need to duplicate the stream handling loop here or refactor.
-                                 // For now, duplication is safer to avoid complex borrow checker issues with recursion/closures in async gen blocks.
+                          match client.chat_completion_stream(spoof_model, messages.clone(), spoof_config.clone(), tools.clone()).await {
+                              Ok(spoof_stream) => {
+                                  // SUCCESS: Reuse the stream handling logic
+                                  // We need to duplicate the stream handling loop here or refactor.
+                                  // For now, duplication is safer to avoid complex borrow checker issues with recursion/closures in async gen blocks.
 
-                                 account_manager.clear_rate_limit(account.index).await;
-                                 use futures_util::StreamExt;
+                                  // NOTE: Don't clear rate limit - primary model is still rate-limited
+                                  // We successfully used a fallback, but the account should stay marked
+                                  // so next request knows to use Strategy 0 (pre-emptive spoofing)
+                                  use futures_util::StreamExt;
                                  let output_stream = spoof_stream; // Move ownership
                                  tokio::pin!(output_stream);
 
