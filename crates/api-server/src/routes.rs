@@ -1001,6 +1001,10 @@ async fn messages_streaming(
 
         // 3. Get Account Loop with Status Updates
         let mut model = model; // Make mutable for spoofing
+        // Track if we used a fallback strategy (don't clear rate limit if we did)
+        let mut used_fallback = false;
+        // Track the original model for rate limit clearing
+        let original_model = model;
         let account = loop {
              match account_manager.get_available_account().await {
                 Some(acc) => break acc,
@@ -1009,20 +1013,21 @@ async fn messages_streaming(
                     tracing::info!("Primary model rate limited. Checking Strategy 0 fallback for {:?}", model);
                     if let Some(spoof_model) = get_spoof_model(model) {
                          tracing::info!("Spoof model available: {:?}", spoof_model);
-                         if let Some(acc) = account_manager.get_available_account_ignoring_rate_limit().await {
-                             // Log the pre-emptive switch
-                             tracing::info!("Strategy 0: Ignoring rate limit and using account {} for spoof model {:?}", acc.email, spoof_model);
-                             let msg = format!("> Primary model rate limited. Strategy 0: Pre-emptive Spoofing {:?} on account {}...\n", spoof_model, acc.email);
-                             let delta = serde_json::json!({
-                                  "type": "content_block_delta",
-                                  "index": status_block_index,
-                                  "delta": { "type": "text_delta", "text": msg }
-                             });
-                             yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+                          if let Some(acc) = account_manager.get_available_account_ignoring_rate_limit().await {
+                              // Log the pre-emptive switch
+                              tracing::info!("Strategy 0: Ignoring rate limit and using account {} for spoof model {:?}", acc.email, spoof_model);
+                              let msg = format!("> Primary model rate limited. Strategy 0: Pre-emptive Spoofing {:?} on account {}...\n", spoof_model, acc.email);
+                              let delta = serde_json::json!({
+                                   "type": "content_block_delta",
+                                   "index": status_block_index,
+                                   "delta": { "type": "text_delta", "text": msg }
+                              });
+                              yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
 
-                             // Swap model and proceed
-                             model = spoof_model;
-                             break acc;
+                              // Swap model and mark that we used a fallback
+                              model = spoof_model;
+                              used_fallback = true;
+                              break acc;
                          } else {
                              tracing::warn!("Strategy 0 Failed: Could not find ANY account (even ignoring rate limits) to try spoofing.");
                          }
@@ -1153,7 +1158,11 @@ async fn messages_streaming(
 
         match result {
             Ok(output_stream) => { // Removed mut here, pin! handles it
-                 account_manager.clear_rate_limit(account.index, ModelFamily::from_model_id(&model.api_id().to_string())).await;
+                 // Only clear rate limit if the PRIMARY request succeeded (not fallback)
+                 // This prevents clearing the wrong model's rate limit when spoofing
+                 if !used_fallback {
+                     account_manager.clear_rate_limit(account.index, ModelFamily::from_model_id(&original_model.api_id().to_string())).await;
+                 }
 
                  use futures_util::StreamExt;
                  // Pin the stream so we can call next()
@@ -1311,21 +1320,24 @@ async fn messages_streaming(
                      account_manager.mark_rate_limited(account.index, ModelFamily::from_model_id(&model.api_id().to_string()), until).await;
 
                       // Strategy 1: Spoofing Fallback
-                      if let Some(spoof_model) = get_spoof_model(model) {
-                          // Check if status block is still open - if not, start a new block for error messages
-                          if !status_block_open {
-                              // Start a new status block since the original is closed
-                              block_index += 1;
-                              let block_start = serde_json::json!({
-                                  "type": "content_block_start",
-                                  "index": block_index,
-                                  "content_block": { "type": "text", "text": "" }
-                              });
-                              yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
-                              status_block_open = true;
-                          }
-                          
-                          let msg = format!("\n> Rate limit hit. Fallback Strategy 1: Spoofing {:?} on same account...\n", spoof_model);
+                       if let Some(spoof_model) = get_spoof_model(model) {
+                           // Mark that we used a fallback strategy
+                           used_fallback = true;
+                           
+                           // Check if status block is still open - if not, start a new block for error messages
+                           if !status_block_open {
+                               // Start a new status block since the original is closed
+                               block_index += 1;
+                               let block_start = serde_json::json!({
+                                   "type": "content_block_start",
+                                   "index": block_index,
+                                   "content_block": { "type": "text", "text": "" }
+                               });
+                               yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
+                               status_block_open = true;
+                           }
+                           
+                           let msg = format!("\n> Rate limit hit. Fallback Strategy 1: Spoofing {:?} on same account...\n", spoof_model);
                           let delta = serde_json::json!({
                                "type": "content_block_delta",
                                "index": if status_block_open { status_block_index } else { block_index },
