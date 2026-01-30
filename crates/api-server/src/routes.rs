@@ -973,6 +973,9 @@ async fn messages_streaming(
         let mut block_index = 0;
         let status_block_index = block_index;
         // Track whether status block is still open - critical for preventing malformed SSE
+        // Note: Compiler warns about unused assignments due to async stream macro limitations,
+        // but this variable IS read across yield boundaries in error handling paths
+        #[allow(unused_assignments)]
         let mut status_block_open = true;
 
         // Use a text block for status updates because 'thinking' blocks are often hidden/collapsed in UIs
@@ -1345,12 +1348,12 @@ async fn messages_streaming(
                                   let output_stream = spoof_stream; // Move ownership
                                   tokio::pin!(output_stream);
 
-                                  // Close status block if it's still open
-                                  if status_block_open {
-                                      let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
-                                      yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
-                                      status_block_open = false;
-                                  }
+                                   // Close status block if it's still open
+                                   if status_block_open {
+                                       let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
+                                       yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+                                       // status_block_open not needed after this point in success path
+                                   }
 
                                  // Start text block
                                  let mut text_index = block_index + 1; // Increment for new block
@@ -1487,7 +1490,7 @@ async fn messages_streaming(
                  if status_block_open {
                      let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
                      yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
-                     status_block_open = false;
+                     // No need to set status_block_open = false here - we're about to return
                  }
 
                 // Emit original error
