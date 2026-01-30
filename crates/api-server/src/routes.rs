@@ -3,7 +3,7 @@ use axum::{
     response::{Html, IntoResponse, Sse, sse::Event},
     http::StatusCode,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use browser_automator::{AntigravityClient, AntigravityModel, Message as AntigravityMessage};
 use futures_util::stream::Stream;
 use std::convert::Infallible;
@@ -12,6 +12,8 @@ use crate::state::AppState;
 
 /// Health check / welcome page at root
 pub async fn health_check() -> Html<&'static str> {
+
+
     Html(r#"<!DOCTYPE html>
 <html>
 <head>
@@ -57,6 +59,67 @@ pub async fn health() -> impl IntoResponse {
         "service": "aether-bridge",
         "version": env!("CARGO_PKG_VERSION")
     })))
+}
+
+/// Helper to convert Anthropic tools to Gemini function declarations
+fn convert_anthropic_tools(payload: &Value) -> Option<Vec<Value>> {
+    if let Some(tools_array) = payload.get("tools").and_then(|t| t.as_array()) {
+        let converted: Vec<Value> = tools_array.iter().map(|tool| {
+            let mut params = tool["input_schema"].clone();
+            sanitize_schema(&mut params);
+
+            serde_json::json!({
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": params
+            })
+        }).collect();
+
+        if !converted.is_empty() {
+            return Some(converted);
+        }
+    }
+    None
+}
+
+/// Recursively sanitizes JSON schema to remove fields forbidden by Antigravity API
+fn sanitize_schema(schema: &mut Value) {
+    if let Some(obj) = schema.as_object_mut() {
+        // 1. Remove forbidden top-level keys
+        let forbidden_keys = [
+            "$schema", "$id", "default", "title", "examples",
+            "minLength", "maxLength", "pattern", "format",
+            "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+            "minItems", "maxItems", "uniqueItems",
+            "minProperties", "maxProperties", "propertyNames",
+            "const", "contentMediaType", "contentEncoding",
+            "additionalProperties" // Often strict in Gemini
+        ];
+
+        for key in forbidden_keys {
+            obj.remove(key);
+        }
+
+        // 2. Recursively process known nested structures
+        if let Some(properties) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            for (_, prop_schema) in properties.iter_mut() {
+                sanitize_schema(prop_schema);
+            }
+        }
+
+        if let Some(items) = obj.get_mut("items") {
+             sanitize_schema(items);
+        }
+
+        // Handle array of schemas (allOf, anyOf, oneOf)
+        for key in ["allOf", "anyOf", "oneOf"] {
+            if let Some(arr) = obj.get_mut(key).and_then(|v| v.as_array_mut()) {
+                for sub_schema in arr {
+                    sanitize_schema(sub_schema);
+                }
+            }
+        }
+    }
 }
 
 /// Mock organization endpoint - Claude CLI calls this on startup
@@ -279,8 +342,11 @@ async fn handle_antigravity_request(
         })
         .collect();
 
+    // Extract valid tools
+    let tools = convert_anthropic_tools(payload);
+
     // Make the API call
-    match client.chat_completion(model, messages, None).await {
+    match client.chat_completion(model, messages, None, tools).await {
         Ok(response) => {
             // Clear rate limit on success
             state.account_manager.clear_rate_limit(account.index).await;
@@ -468,8 +534,12 @@ pub async fn messages(
         None
     };
 
+    // Extract tools and convert to Gemini format
+    // Extract tools from payload
+    let tools = convert_anthropic_tools(&payload);
+
     // Make the API call with potential spoofing
-    let result = client.chat_completion(model, messages.clone(), thinking_config.clone()).await;
+    let result = client.chat_completion(model, messages.clone(), thinking_config.clone(), tools.clone()).await;
 
     let api_result = match result {
         Err(e) => {
@@ -498,7 +568,7 @@ pub async fn messages(
                  if let Some(spoof_model) = get_spoof_model(model) {
                      tracing::info!("Strategy 1: Spoofing {:?} on same account...", spoof_model);
                      let spoof_config = adapt_config_for_spoof(&thinking_config, spoof_model);
-                     match client.chat_completion(spoof_model, messages.clone(), spoof_config.clone()).await {
+                     match client.chat_completion(spoof_model, messages.clone(), spoof_config.clone(), tools.clone()).await {
                          Ok(res) => {
                              spoof_success = true;
                              final_res = Ok(res);
@@ -525,7 +595,7 @@ pub async fn messages(
                                  thinking_config.clone()
                              };
 
-                             match new_client.chat_completion(target_model, messages, target_config).await {
+                             match new_client.chat_completion(target_model, messages, target_config, tools.clone()).await {
                                  Ok(res) => {
                                      state.account_manager.clear_rate_limit(new_account.index).await;
                                      final_res = Ok(res);
@@ -923,6 +993,8 @@ async fn messages_streaming(
 
         // 5. Convert Messages & Config
         let messages = convert_anthropic_messages(&payload);
+        let tools = convert_anthropic_tools(&payload);
+
         let thinking_config = if thinking_enabled && model.supports_thinking() {
              // Extract budget from request if specified
              let budget = payload["thinking"]
@@ -950,7 +1022,7 @@ async fn messages_streaming(
         // 6. Make API Streaming Request
         tracing::info!("Starting streaming request to Antigravity model: {:?}", model);
         let start_time = std::time::Instant::now();
-        let result = client.chat_completion_stream(model, messages.clone(), thinking_config.clone()).await;
+        let result = client.chat_completion_stream(model, messages.clone(), thinking_config.clone(), tools.clone()).await;
 
         match result {
             Ok(output_stream) => { // Removed mut here, pin! handles it
@@ -962,7 +1034,7 @@ async fn messages_streaming(
 
                  // We will simply stream everything into a single text block to guarantee visibility.
                  // System logs (index 0) are closed. We start index 1.
-                 let text_index = block_index;
+                 let mut text_index = block_index;
 
                  let block_start = serde_json::json!({
                     "type": "content_block_start",
@@ -978,33 +1050,82 @@ async fn messages_streaming(
                          Ok(chunk) => {
                              if chunk.done { break; }
 
-                             let mut text_to_emit = chunk.delta;
+                             if chunk.is_tool_use {
+                                 // Close current text block if open
+                                 let block_stop = serde_json::json!({ "type": "content_block_stop", "index": text_index });
+                                 yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
 
-                             // Optional: Visual indication of thinking vs answer
-                             if chunk.is_thinking {
-                                 if !inside_thought {
-                                     // Start of a thought sequence
-                                     text_to_emit = format!("\n> *Thinking: {}*", text_to_emit);
-                                     inside_thought = true;
-                                 } else {
-                                     // Continue thought - maybe italicize?
-                                     // Markdown within a stream is tricky, usually we just dump text.
-                                     // Let's just dump it. formatting every chunk is risky.
+                                 // Increment block index for tool use
+                                 text_index += 1; // Actually tool_index, but we reuse the variable for sequential indexing
+
+                                 // Parse tool use JSON
+                                 if let Ok(mut tool_json) = serde_json::from_str::<Value>(&chunk.delta) {
+                                      // Extract input for delta
+                                      let input_obj = tool_json.get("input").cloned().unwrap_or(json!({}));
+                                      // Remove input from start block (or set to empty)
+                                      if let Some(obj) = tool_json.as_object_mut() {
+                                           obj.insert("input".to_string(), json!({}));
+                                      }
+
+                                      let block_start = serde_json::json!({
+                                          "type": "content_block_start",
+                                          "index": text_index,
+                                          "content_block": tool_json
+                                      });
+                                      yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
+
+                                      // Emit input as delta
+                                      let input_str = serde_json::to_string(&input_obj).unwrap_or_default();
+                                      let delta = serde_json::json!({
+                                          "type": "content_block_delta",
+                                          "index": text_index,
+                                          "delta": { "type": "input_json_delta", "partial_json": input_str }
+                                      });
+                                      yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+
+                                      // Evaluate block stop immediately as tools are atomic in this stream logic
+                                      let block_stop = serde_json::json!({ "type": "content_block_stop", "index": text_index });
+                                      yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+
+                                      // Prepare for next text block
+                                      text_index += 1;
+                                      let block_start = serde_json::json!({
+                                          "type": "content_block_start",
+                                          "index": text_index,
+                                          "content_block": { "type": "text", "text": "" }
+                                      });
+                                      yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
                                  }
                              } else {
-                                 if inside_thought {
-                                     // End of thought sequence
-                                     text_to_emit = format!("\n\n{}", text_to_emit);
-                                     inside_thought = false;
-                                 }
-                             }
+                                 // Normal text/thinking processing
+                                 let mut text_to_emit = chunk.delta;
 
-                             let delta = serde_json::json!({
-                                "type": "content_block_delta",
-                                "index": text_index,
-                                "delta": { "type": "text_delta", "text": text_to_emit }
-                             });
-                             yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+                                 // Optional: Visual indication of thinking vs answer
+                                 if chunk.is_thinking {
+                                     if !inside_thought {
+                                         // Start of a thought sequence
+                                         text_to_emit = format!("\n> *Thinking: {}*", text_to_emit);
+                                         inside_thought = true;
+                                     } else {
+                                         // Continue thought - maybe italicize?
+                                         // Markdown within a stream is tricky, usually we just dump text.
+                                         // Let's just dump it. formatting every chunk is risky.
+                                     }
+                                 } else {
+                                     if inside_thought {
+                                         // End of thought sequence
+                                         text_to_emit = format!("\n\n{}", text_to_emit);
+                                         inside_thought = false;
+                                     }
+                                 }
+
+                                 let delta = serde_json::json!({
+                                    "type": "content_block_delta",
+                                    "index": text_index,
+                                    "delta": { "type": "text_delta", "text": text_to_emit }
+                                 });
+                                 yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+                             }
                          },
                          Err(e) => {
                              let err_msg = e.to_string();
@@ -1060,7 +1181,7 @@ async fn messages_streaming(
 
                          // Adapt config and retry
                          let spoof_config = adapt_config_for_spoof(&thinking_config, spoof_model);
-                         match client.chat_completion_stream(spoof_model, messages.clone(), spoof_config.clone()).await {
+                         match client.chat_completion_stream(spoof_model, messages.clone(), spoof_config.clone(), tools.clone()).await {
                              Ok(spoof_stream) => {
                                  // SUCCESS: Reuse the stream handling logic
                                  // We need to duplicate the stream handling loop here or refactor.
@@ -1076,7 +1197,7 @@ async fn messages_streaming(
                                  yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
 
                                  // Start text block
-                                 let text_index = block_index + 1; // Increment for new block
+                                 let mut text_index = block_index + 1; // Increment for new block
                                  let block_start = serde_json::json!({
                                     "type": "content_block_start",
                                     "index": text_index,
@@ -1089,24 +1210,73 @@ async fn messages_streaming(
                                      match chunk_res {
                                          Ok(chunk) => {
                                              if chunk.done { break; }
-                                             let mut text_to_emit = chunk.delta;
-                                             if chunk.is_thinking {
-                                                 if !inside_thought {
-                                                     text_to_emit = format!("\n> *Thinking: {}*", text_to_emit);
-                                                     inside_thought = true;
-                                                 }
+
+                                             if chunk.is_tool_use {
+                                                  // Close current text block if open
+                                                  let block_stop = serde_json::json!({ "type": "content_block_stop", "index": text_index });
+                                                  yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+
+                                                  // Increment block index for tool use
+                                                  text_index += 1;
+
+                                                  // Parse tool use JSON
+                                                  if let Ok(mut tool_json) = serde_json::from_str::<Value>(&chunk.delta) {
+                                                       // Extract input for delta
+                                                       let input_obj = tool_json.get("input").cloned().unwrap_or(json!({}));
+                                                       // Remove input from start block (or set to empty)
+                                                       if let Some(obj) = tool_json.as_object_mut() {
+                                                            obj.insert("input".to_string(), json!({}));
+                                                       }
+
+                                                       let block_start = serde_json::json!({
+                                                           "type": "content_block_start",
+                                                           "index": text_index,
+                                                           "content_block": tool_json
+                                                       });
+                                                       yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
+
+                                                       // Emit input as delta
+                                                       let input_str = serde_json::to_string(&input_obj).unwrap_or_default();
+                                                       let delta = serde_json::json!({
+                                                           "type": "content_block_delta",
+                                                           "index": text_index,
+                                                           "delta": { "type": "input_json_delta", "partial_json": input_str }
+                                                       });
+                                                       yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+
+                                                       // Evaluate block stop immediately as tools are atomic in this stream logic
+                                                       let block_stop = serde_json::json!({ "type": "content_block_stop", "index": text_index });
+                                                       yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+
+                                                       // Prepare for next text block
+                                                       text_index += 1;
+                                                       let block_start = serde_json::json!({
+                                                           "type": "content_block_start",
+                                                           "index": text_index,
+                                                           "content_block": { "type": "text", "text": "" }
+                                                       });
+                                                       yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
+                                                  }
                                              } else {
-                                                 if inside_thought {
-                                                     text_to_emit = format!("\n\n{}", text_to_emit);
-                                                     inside_thought = false;
+                                                 let mut text_to_emit = chunk.delta;
+                                                 if chunk.is_thinking {
+                                                     if !inside_thought {
+                                                         text_to_emit = format!("\n> *Thinking: {}*", text_to_emit);
+                                                         inside_thought = true;
+                                                     }
+                                                 } else {
+                                                     if inside_thought {
+                                                         text_to_emit = format!("\n\n{}", text_to_emit);
+                                                         inside_thought = false;
+                                                     }
                                                  }
+                                                 let delta = serde_json::json!({
+                                                    "type": "content_block_delta",
+                                                    "index": text_index,
+                                                    "delta": { "type": "text_delta", "text": text_to_emit }
+                                                 });
+                                                 yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
                                              }
-                                             let delta = serde_json::json!({
-                                                "type": "content_block_delta",
-                                                "index": text_index,
-                                                "delta": { "type": "text_delta", "text": text_to_emit }
-                                             });
-                                             yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
                                          },
                                          Err(e) => {
                                              let err_msg = e.to_string();

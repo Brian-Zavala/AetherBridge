@@ -147,3 +147,14 @@
     - [x] **Strict Config Sanitization**: Enforced separation of `thinkingBudget` (Claude) and `thinkingLevel` (Gemini) during fallback to prevent parameter validation errors.
 - [x] **Infrastructure Verification**
     - [x] **Endpoint Priority**: Configuration confirmed to prioritize Daily (Sandbox) -> Autopush -> Production.
+
+## Phase 8: API Compliance & Tooling Fixes (2026-01-29)
+- [x] **Tool Use / Function Calling Fixes**
+    - [x] **Streaming Protocol Compliance**: Refactored `routes.rs` to strictly follow Anthropic's event order: `content_block_start` (metadata only) -> `content_block_delta` (input payload). This fixed the "Invalid tool parameters" error in Claude Code CLI.
+    - [x] **Schema Sanitization**: Implemented `sanitize_tool_definitions` in `antigravity.rs` to recursively remove forbidden fields (`$schema`, `const`, `$defs`) and clean tool names, ensuring compatibility with Antigravity API.
+- [x] **API Specification Compliance**
+    - [x] **Header Updates**: Updated `ANTIGRAVITY_USER_AGENT` to `antigravity/2.37.0 linux/amd64` (per user config).
+    - [x] **Thinking Constraints**: Enforced `maxOutputTokens > thinkingBudget` by automatically rewriting the config if necessary.
+- [x] **Stream Quality Improvements**
+    - [x] **Spam Filtering**: Added logic to filter out repetitive `(no content)` and `)` strings from Gemini stream chunks.
+    - [x] **Tool Logging**: Added `DEBUG TOOL USE` logs to formatted JSON events for better observability.

@@ -208,6 +208,8 @@ pub struct StreamChunk {
     pub delta: String,
     /// Whether this is thinking content
     pub is_thinking: bool,
+    /// Whether this is a tool use (function call)
+    pub is_tool_use: bool,
     /// Whether this is the final chunk
     pub done: bool,
 }
@@ -400,6 +402,7 @@ impl AntigravityClient {
         model: AntigravityModel,
         messages: &[Message],
         thinking: Option<&ThinkingConfig>,
+        tools: Option<&Vec<Value>>,
     ) -> Value {
         // Separate system messages from chat content
         let (system_messages, chat_messages): (Vec<&Message>, Vec<&Message>) = messages.iter()
@@ -429,6 +432,12 @@ impl AntigravityClient {
                             "thinkingBudget": budget,
                             "includeThoughts": thinking.include_thoughts
                         });
+                        // Ensure maxOutputTokens > thinkingBudget (spec requirement)
+                        if let Some(max_tokens) = generation_config.get_mut("maxOutputTokens").and_then(|v| v.as_u64()) {
+                            if max_tokens <= budget as u64 {
+                                generation_config["maxOutputTokens"] = json!(budget + 8192);
+                            }
+                        }
                     }
                 } else {
                     // FIXED: Gemini 3 requires thinkingLevel ONLY
@@ -487,7 +496,78 @@ impl AntigravityClient {
             }
         }
 
+        // Add tools if present
+        if let Some(tool_defs) = tools {
+            if !tool_defs.is_empty() {
+                 let sanitized_tools: Vec<Value> = tool_defs.iter().map(|t| Self::sanitize_tool_definition(t)).collect();
+                 if let Some(request_obj) = body.get_mut("request").and_then(|r| r.as_object_mut()) {
+                    request_obj.insert("tools".to_string(), json!([{
+                        "function_declarations": sanitized_tools
+                    }]));
+                }
+            }
+        }
+
         body
+    }
+
+    /// Sanitizes tool definitions to be compatible with Antigravity API
+    fn sanitize_tool_definition(tool: &Value) -> Value {
+        let mut sanitized = tool.clone();
+
+        // Recursively walk and clean the schema
+        if let Some(params) = sanitized.get_mut("parameters") {
+            Self::sanitize_schema(params);
+        }
+
+        // Sanitize name
+        if let Some(name) = sanitized.get_mut("name").and_then(|v| v.as_str()) {
+            // Rule: Must start with letter/underscore, contain only a-zA-Z0-9_.-
+            // Rule: No slashes
+            let mut new_name = name.replace('/', "_").replace(' ', "_");
+            if let Some(first) = new_name.chars().next() {
+                if first.is_ascii_digit() {
+                    new_name = format!("_{}", new_name);
+                }
+            }
+            // Filter invalid chars
+            new_name = new_name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.' || *c == ':' || *c == '-').collect();
+            sanitized["name"] = json!(new_name);
+        }
+
+        sanitized
+    }
+
+    /// Recursively sanitizes JSON schema for Antigravity
+    fn sanitize_schema(schema: &mut Value) {
+        if let Some(obj) = schema.as_object_mut() {
+            // Remove forbidden keys
+            obj.remove("$schema");
+            obj.remove("$id");
+            obj.remove("$ref");
+            obj.remove("$defs");
+            obj.remove("definitions");
+            obj.remove("default");
+            obj.remove("examples");
+            // const is not supported, ref is not supported
+
+            // Transform strict `const` to `enum` (if present directly)
+            if let Some(const_val) = obj.remove("const") {
+                obj.insert("enum".to_string(), json!([const_val]));
+            }
+
+            // Recurse into properties
+            if let Some(props) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
+                for (_, value) in props.iter_mut() {
+                    Self::sanitize_schema(value);
+                }
+            }
+
+            // Recurse into items (array)
+            if let Some(items) = obj.get_mut("items") {
+                Self::sanitize_schema(items);
+            }
+        }
     }
 
     /// Sends a chat completion request
@@ -497,9 +577,10 @@ impl AntigravityClient {
         model: AntigravityModel,
         messages: Vec<Message>,
         thinking: Option<ThinkingConfig>,
+        tools: Option<Vec<Value>>,
     ) -> Result<ChatResponse> {
         // Use the streaming implementation
-        let stream = self.chat_completion_stream(model.clone(), messages, thinking).await?;
+        let stream = self.chat_completion_stream(model.clone(), messages, thinking, tools).await?;
         let mut stream = Box::pin(stream);
 
         let mut full_content = String::new();
@@ -604,6 +685,7 @@ impl AntigravityClient {
         model: AntigravityModel,
         messages: Vec<Message>,
         thinking: Option<ThinkingConfig>,
+        tools: Option<Vec<Value>>,
     ) -> Result<impl futures::Stream<Item = Result<StreamChunk>> + Send> {
         // Ensure we have a valid project ID
         self.fetch_provisioned_project_id().await;
@@ -614,7 +696,7 @@ impl AntigravityClient {
         let token = self.access_token.read().await.clone();
         let project_id = self.project_id.read().await.clone();
 
-        let body = self.build_request_body(&project_id, model, &messages, thinking.as_ref());
+        let body = self.build_request_body(&project_id, model, &messages, thinking.as_ref(), tools.as_ref());
 
         debug!("Sending streaming request to {}", url);
 
@@ -665,7 +747,7 @@ impl AntigravityClient {
                     let trimmed = line.trim();
                     if trimmed.is_empty() { continue; }
 
-                    tracing::debug!("Processing stream line: {}", trimmed); // DEBUG LOG
+                    // tracing::info!("DEBUG RAW STREAM: {}", trimmed); // FORCE LOGGING
 
                     if let Some(data) = trimmed.strip_prefix("data: ") {
                         if data == "[DONE]" {
@@ -683,9 +765,26 @@ impl AntigravityClient {
                                              for part in parts {
                                                  let is_thought = part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
                                                  if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                                      if text.contains("(no content)") { continue; }
                                                      yield StreamChunk {
                                                          delta: text.to_string(),
                                                          is_thinking: is_thought,
+                                                         is_tool_use: false,
+                                                         done: false,
+                                                     };
+                                                 } else if let Some(call) = part.get("functionCall") {
+                                                     // Convert Gemini functionCall back to Anthropic tool_use JSON
+                                                     let tool_use = serde_json::json!({
+                                                         "type": "tool_use",
+                                                         "id": format!("call_{}", &Uuid::new_v4().to_string().replace("-", "")[..12]),
+                                                         "name": call.get("name"),
+                                                         "input": call.get("args")
+                                                     });
+                                                      tracing::info!("DEBUG TOOL USE: {}", tool_use);
+                                                     yield StreamChunk {
+                                                         delta: tool_use.to_string(),
+                                                         is_thinking: false,
+                                                         is_tool_use: true,
                                                          done: false,
                                                      };
                                                  }
@@ -711,9 +810,26 @@ impl AntigravityClient {
                                              for part in parts {
                                                  let is_thought = part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
                                                  if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                                      if text.contains("(no content)") { continue; }
                                                      yield StreamChunk {
                                                          delta: text.to_string(),
                                                          is_thinking: is_thought,
+                                                         is_tool_use: false,
+                                                         done: false,
+                                                     };
+                                                 } else if let Some(call) = part.get("functionCall") {
+                                                     // Convert Gemini functionCall back to Anthropic tool_use JSON
+                                                     let tool_use = serde_json::json!({
+                                                         "type": "tool_use",
+                                                         "id": format!("call_{}", &Uuid::new_v4().to_string().replace("-", "")[..12]),
+                                                         "name": call.get("name"),
+                                                         "input": call.get("args")
+                                                     });
+                                                      tracing::info!("DEBUG TOOL USE: {}", tool_use);
+                                                     yield StreamChunk {
+                                                         delta: tool_use.to_string(),
+                                                         is_thinking: false,
+                                                         is_tool_use: true,
                                                          done: false,
                                                      };
                                                  }
@@ -730,7 +846,7 @@ impl AntigravityClient {
                     }
                 }
             }
-            yield StreamChunk { delta: "".into(), is_thinking: false, done: true };
+            yield StreamChunk { delta: "".into(), is_thinking: false, is_tool_use: false, done: true };
         };
 
         Ok(output_stream)
@@ -782,5 +898,44 @@ mod tests {
         assert!(AntigravityModel::ClaudeSonnet45Thinking.is_claude());
         assert!(!AntigravityModel::Gemini3Pro.is_claude());
         assert!(AntigravityModel::Gemini3Pro.supports_thinking());
+    }
+
+    #[test]
+    fn test_sanitize_tool_definition() {
+        let tool = serde_json::json!({
+            "name": "invalid/tool name",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "field1": {
+                        "type": "string",
+                        "const": "fixed_value"
+                    },
+                    "field2": {
+                        "$ref": "#/definitions/SomeType"
+                    }
+                },
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            }
+        });
+
+        let sanitized = AntigravityClient::sanitize_tool_definition(&tool);
+
+        // Check name sanitization
+        assert_eq!(sanitized["name"], "invalid_tool_name");
+
+        // Check schema sanitization
+        let props = sanitized["parameters"]["properties"].as_object().unwrap();
+
+        // const should be converted to enum
+        let field1 = &props["field1"];
+        assert!(field1.get("const").is_none());
+        assert_eq!(field1["enum"], serde_json::json!(["fixed_value"]));
+
+        // $ref and $schema should be removed
+        let field2 = &props["field2"];
+        assert!(field2.get("$ref").is_none());
+
+        assert!(sanitized["parameters"].get("$schema").is_none());
     }
 }

@@ -22,11 +22,10 @@ AetherBridge now proxies requests to Google's Antigravity API using OAuth tokens
     - [x] Test streaming functionality (Fixed 400 errors and reliability)
     - [x] **Verify "Strategy 0" Rate Limit Fallback**: Confirmed working. `Gemini3Flash` now self-spoofs to trigger session rotation on 429s.
     - [x] **Verify Thinking Config**: Fixed 400 Bad Request by mapping Anthropic budgets to Gemini thinking levels.
-- [ ] Implement Tool Use / Function Calling (Critical for Agentic features)
-    - **Current Status**: Claude tools fail because Antigravity proxy strips tool definitions.
-    - [ ] **Implement Google Search Wrapper**: Create a separate tool execution path using Gemini 3 Flash to perform searches and inject results, bypassing the stripping issue.
-    - [ ] Map Anthropic tool definitions to Antigravity (native or via system prompt)
-    - [ ] Verify Claude Code can execute tools (bash, glob, etc.) through the bridge
+- [x] Implement Tool Use / Function Calling (Critical for Agentic features)
+    - [x] **Fix Tool Definition Stripping**: Implemented `sanitize_tool_definitions` in `antigravity.rs` to clean schemas (remove `const`, `$schema`, etc.) and ensure API compliance.
+    - [x] **Fix Streaming Protocol**: Refactored `routes.rs` to correctly split tool use events into `content_block_start` (metadata) and `content_block_delta` (input payload) to fix "Invalid tool parameters" errors in Claude Code CLI.
+    - [x] **Verify Claude Code Tool Execution**: Verified tools work correctly through the bridge.
 - [x] Debug and fix any Claude Code compatibility issues
     - [x] Verify SSE event format matches Anthropic spec
     - [x] Handle edge cases (Fixed 404s, 500s, 400s)

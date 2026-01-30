@@ -63,11 +63,17 @@ pub const ANTIGRAVITY_DEFAULT_PROJECT_ID: &str = "REQUIRE_USER_PROJECT_ID";
 // =============================================================================
 
 /// User-Agent header for Antigravity requests
-pub const ANTIGRAVITY_USER_AGENT: &str = "antigravity/1.11.5 linux/amd64";
+pub const ANTIGRAVITY_USER_AGENT: &str = "antigravity/1.15.8 linux/arm64";
 
 /// X-Goog-Api-Client header
-pub const ANTIGRAVITY_API_CLIENT: &str = "google-cloud-sdk vscode_cloudshelleditor/0.1";
+pub const ANTIGRAVITY_API_CLIENT: &str = "google-cloud-sdk vscode/1.87.0";
 
 /// Client-Metadata header (JSON)
 pub const ANTIGRAVITY_CLIENT_METADATA: &str =
-    r#"{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}"#;
+    r#"{"ideType":"VSCODE","platform":"LINUX","pluginType":"GEMINI"}"#;
+
+/// Device ID (from fingerprint)
+pub const ANTIGRAVITY_DEVICE_ID: &str = "befdc73e-3880-4250-a375-8615c547971e";
+
+/// Session Token (from fingerprint)
+pub const ANTIGRAVITY_SESSION_TOKEN: &str = "84610094a98770a858bac917af8de1c9";

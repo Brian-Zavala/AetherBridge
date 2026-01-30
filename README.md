@@ -49,6 +49,9 @@ export ANTHROPIC_API_KEY="aetherbridge"  # Dummy key
 
 # Run the tool
 claude
+
+# ✅ Tool Use / Function Calling is fully supported!
+# AetherBridge automatically handles tool schema compatibility and execution.
 ```
 
 #### 💻 VS Code Extensions (Continue, Roo Code, etc.)
