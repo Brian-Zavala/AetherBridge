@@ -3,6 +3,7 @@ use tokio::sync::Mutex;
 use common::config::Config;
 use browser_automator::Automator;
 use oauth::AccountManager;
+use browser_automator::fingerprint::Fingerprint;
 
 /// Shared application state
 #[derive(Clone)]
@@ -12,7 +13,10 @@ pub struct AppState {
     /// Browser automator for legacy protocol driver
     pub automator: Arc<Mutex<Automator>>,
     /// OAuth account manager for Antigravity authentication
+    /// OAuth account manager for Antigravity authentication
     pub account_manager: Arc<AccountManager>,
+    /// Session-based device fingerprint
+    pub fingerprint: Arc<Fingerprint>,
 }
 
 impl AppState {
@@ -24,6 +28,7 @@ impl AppState {
             config: Arc::new(config),
             automator: Arc::new(Mutex::new(automator)),
             account_manager: Arc::new(AccountManager::empty()),
+            fingerprint: Arc::new(Fingerprint::generate()),
         }
     }
 
@@ -35,6 +40,7 @@ impl AppState {
             config: Arc::new(config),
             automator: Arc::new(Mutex::new(automator)),
             account_manager: Arc::new(account_manager),
+            fingerprint: Arc::new(Fingerprint::generate()),
         })
     }
 

@@ -13,6 +13,7 @@ use oauth::constants::{
     ANTIGRAVITY_API_CLIENT, ANTIGRAVITY_CLIENT_METADATA,
     ANTIGRAVITY_DEFAULT_PROJECT_ID,
 };
+use crate::fingerprint::Fingerprint;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -21,6 +22,62 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn, error, info};
 use uuid::Uuid;
 use futures::StreamExt; // Required for stream collection
+
+// =============================================================================
+// Rate Limit Helpers
+// =============================================================================
+
+/// Extracts retry duration from error message text
+/// Looks for patterns like "Retry after 30s", "rate limit exceeded (retry in 60s)", etc.
+fn extract_retry_from_error(error_text: &str) -> Option<u64> {
+    // Common patterns in Google's error messages
+    let patterns = [
+        r"retry after (\d+)s",
+        r"retry in (\d+)s",
+        r"rate limit exceeded.*?retry.*?after (\d+)",
+        r"quota exceeded.*?retry after (\d+)",
+        r"try again in (\d+) seconds",
+    ];
+    
+    for pattern in patterns {
+        if let Ok(re) = regex::Regex::new(&format!("(?i){}", pattern)) {
+            if let Some(caps) = re.captures(error_text) {
+                if let Some(num) = caps.get(1) {
+                    if let Ok(seconds) = num.as_str().parse::<u64>() {
+                        return Some(seconds);
+                    }
+                }
+            }
+        }
+    }
+    
+    None
+}
+
+/// Calculates exponential backoff with jitter
+/// base_seconds: initial retry duration
+/// attempt: retry attempt number (0-indexed)
+/// max_seconds: maximum retry duration
+/// Returns: duration to wait in seconds
+fn exponential_backoff_with_jitter(base_seconds: u64, attempt: u32, max_seconds: u64) -> u64 {
+    use rand::Rng;
+    
+    // Exponential backoff: base * 2^attempt
+    let exponential = base_seconds.saturating_mul(2_u64.saturating_pow(attempt));
+    
+    // Cap at max
+    let capped = exponential.min(max_seconds);
+    
+    // Add jitter (±25% random variation)
+    let jitter_range = capped / 4;
+    let jitter = if jitter_range > 0 {
+        rand::thread_rng().gen_range(0..=jitter_range)
+    } else {
+        0
+    };
+    
+    capped + jitter
+}
 
 // =============================================================================
 // Model Definitions
@@ -239,15 +296,35 @@ pub struct AntigravityClient {
     endpoint_index: Arc<RwLock<usize>>,
     /// If true, we will NOT try to overwrite the project_id via auto-discovery
     force_project_id: bool,
+    /// Device fingerprint for request headers
+    fingerprint: Option<Fingerprint>,
 }
 
 impl AntigravityClient {
     /// Creates a new AntigravityClient with the given access token
-    pub fn new(access_token: String, project_id: Option<String>) -> Result<Self> {
+    /// Creates a new AntigravityClient with the given access token
+    pub fn new(access_token: String, project_id: Option<String>, fingerprint: Option<Fingerprint>) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        headers.insert("User-Agent", HeaderValue::from_static(ANTIGRAVITY_USER_AGENT));
-        headers.insert("X-Goog-Api-Client", HeaderValue::from_static(ANTIGRAVITY_API_CLIENT));
-        headers.insert("Client-Metadata", HeaderValue::from_static(ANTIGRAVITY_CLIENT_METADATA));
+
+        // Apply fingerprint headers if available, otherwise fallback to static defaults
+        if let Some(ref fp) = fingerprint {
+            let fp_headers = fp.to_headers();
+            for (k, v) in fp_headers {
+                if let Ok(name) = reqwest::header::HeaderName::from_bytes(k.as_bytes()) {
+                    if let Ok(val) = HeaderValue::from_str(&v) {
+                        headers.insert(name, val);
+                    }
+                }
+            }
+        } else {
+            // Fallback to static constants -> but wait, constants.rs has them defined.
+            // Be careful to use the imported constants if fingerprint is missing.
+            use oauth::constants::{ANTIGRAVITY_USER_AGENT, ANTIGRAVITY_API_CLIENT, ANTIGRAVITY_CLIENT_METADATA};
+            headers.insert("User-Agent", HeaderValue::from_static(ANTIGRAVITY_USER_AGENT));
+            headers.insert("X-Goog-Api-Client", HeaderValue::from_static(ANTIGRAVITY_API_CLIENT));
+            headers.insert("Client-Metadata", HeaderValue::from_static(ANTIGRAVITY_CLIENT_METADATA));
+        }
+
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         // Session Distribution: Randomize session ID to avoid rate limit tracking by client ID
@@ -295,6 +372,7 @@ impl AntigravityClient {
             project_id: Arc::new(RwLock::new(selected_project)),
             endpoint_index: Arc::new(RwLock::new(0)),
             force_project_id: force,
+            fingerprint,
         })
     }
 
@@ -409,10 +487,19 @@ impl AntigravityClient {
             .partition(|m| m.role == "system");
 
         // Convert chat messages to Gemini format (contents array)
+        // CRITICAL: Strip thinking blocks to prevent signature corruption
+        // See: https://github.com/NoeFabris/opencode-antigravity-auth/blob/main/docs/ARCHITECTURE.md
         let contents: Vec<Value> = chat_messages.iter().map(|m| {
+            let role = if m.role == "assistant" { "model" } else { &m.role };
+            // For assistant messages, strip any thinking content markers
+            let content = if m.role == "assistant" {
+                Self::strip_thinking_content(&m.content)
+            } else {
+                m.content.clone()
+            };
             json!({
-                "role": if m.role == "assistant" { "model" } else { &m.role },
-                "parts": [{"text": &m.content}]
+                "role": role,
+                "parts": [{"text": content}]
             })
         }).collect();
 
@@ -509,6 +596,32 @@ impl AntigravityClient {
         }
 
         body
+    }
+
+    /// Strips thinking content markers from assistant messages
+    /// This prevents signature corruption errors when thinking blocks are stored
+    /// and re-sent by the client. Claude will generate fresh thinking.
+    fn strip_thinking_content(content: &str) -> String {
+        // Remove thinking blocks marked with various formats
+        // Format 1: <thinking>...</thinking>
+        // Format 2: [Thinking: ...]
+        // Format 3: > *Thinking: ...*
+        let patterns = [
+            r"<thinking>.*?</thinking>",
+            r"\[Thinking:.*?\]",
+            r"> \*Thinking:.*?\*\n\n",
+            r"> \*Thinking:.*?\*",
+        ];
+        
+        let mut result = content.to_string();
+        for pattern in patterns {
+            if let Ok(re) = regex::Regex::new(&format!("(?s){}", pattern)) {
+                result = re.replace_all(&result, "").to_string();
+            }
+        }
+        
+        // Clean up any resulting double newlines
+        result.replace("\n\n\n", "\n\n")
     }
 
     /// Sanitizes tool definitions to be compatible with Antigravity API
@@ -700,6 +813,13 @@ impl AntigravityClient {
 
         debug!("Sending streaming request to {}", url);
 
+        // Add request jitter to reduce detection patterns (0-500ms random delay)
+        // This helps prevent rate limiting by making requests look less automated
+        let jitter_ms = rand::random::<u64>() % 500;
+        if jitter_ms > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(jitter_ms)).await;
+        }
+
         let request = self.client
             .post(&url)
             .header(AUTHORIZATION, format!("Bearer {}", token))
@@ -713,11 +833,30 @@ impl AntigravityClient {
         let status = response.status();
 
         if !status.is_success() {
+            // Extract retry-after header if present
+            let retry_after = response.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            
             let error_text = response.text().await?;
-            // Handle rate limiting specifically
+            
+            // Handle rate limiting specifically (429)
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                 return Err(anyhow!("RATE_LIMITED:60:{}", error_text));
+                let retry_seconds = retry_after.unwrap_or_else(|| {
+                    // Try to extract from error message
+                    extract_retry_from_error(&error_text).unwrap_or(60)
+                });
+                return Err(anyhow!("RATE_LIMITED:{}:{}", retry_seconds, error_text));
             }
+            
+            // Handle capacity errors (503/529) with special retry logic
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE || 
+               status.as_u16() == 529 {  // 529 = "Site is overloaded"
+                let retry_seconds = retry_after.unwrap_or(45); // Default 45s for capacity
+                return Err(anyhow!("CAPACITY_ERROR:{}:{}", retry_seconds, error_text));
+            }
+            
             // 2026-01-28: Handle "Permission denied" specifically
             if status == reqwest::StatusCode::FORBIDDEN && error_text.contains("generateChat") {
                  return Err(anyhow!("IAM_PERMISSION_DENIED: The Project ID '{}' likely needs the Gemini API enabled. {}", project_id, error_text));

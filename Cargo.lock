@@ -644,6 +644,7 @@ dependencies = [
  "oauth",
  "ocrs",
  "rand 0.8.5",
+ "regex",
  "reqwest",
  "rten 0.13.1",
  "rusqlite",

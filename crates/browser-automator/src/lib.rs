@@ -1,5 +1,6 @@
 pub mod antigravity;
 pub mod auth;
+pub mod fingerprint;
 pub mod google_driver;
 pub mod protocol_driver;
 pub mod visual_driver;
@@ -12,6 +13,7 @@ pub use antigravity::{
     AntigravityClient, AntigravityModel, Message, ChatResponse,
     ThinkingConfig, Usage, StreamChunk,
 };
+pub use fingerprint::{Fingerprint, HeaderStyle};
 
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -62,7 +64,8 @@ impl Automator {
 
     /// Creates an Automator with an OAuth-authenticated Antigravity client
     pub fn with_antigravity(access_token: String, project_id: Option<String>) -> Result<Self> {
-        let antigravity = Some(AntigravityClient::new(access_token, project_id)?);
+        let fingerprint = fingerprint::Fingerprint::generate();
+        let antigravity = Some(AntigravityClient::new(access_token, project_id, Some(fingerprint))?);
 
         Ok(Self {
             protocol: None,

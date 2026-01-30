@@ -315,7 +315,7 @@ async fn handle_antigravity_request(
 
     // Create the Antigravity client with user's project ID from config
     let project_id = state.config.project_id.clone();
-    let client = match AntigravityClient::new(account.access_token.clone(), project_id) {
+    let client = match AntigravityClient::new(account.access_token.clone(), project_id, Some((*state.fingerprint).clone())) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to create Antigravity client: {}", e);
@@ -375,21 +375,30 @@ async fn handle_antigravity_request(
         Err(e) => {
             let error_str = e.to_string();
 
-            // Check for rate limiting
-            if error_str.starts_with("RATE_LIMITED:") {
+            // Check for rate limiting or capacity errors
+            if error_str.starts_with("RATE_LIMITED:") || error_str.starts_with("CAPACITY_ERROR:") {
                 let parts: Vec<&str> = error_str.splitn(3, ':').collect();
                 let seconds = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
-                let until = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
+                
+                // Use longer backoff for capacity errors
+                let is_capacity = error_str.starts_with("CAPACITY_ERROR:");
+                let effective_seconds = if is_capacity {
+                    std::cmp::max(seconds, 45)
+                } else {
+                    seconds
+                };
+                
+                let until = chrono::Utc::now() + chrono::Duration::seconds(effective_seconds as i64);
 
                 state.account_manager.mark_rate_limited(account.index, until).await;
 
-                // Try again with next account (recursive call would be cleaner but let's be explicit)
-                tracing::warn!("Account {} rate limited, marked for {} seconds", account.email, seconds);
+                let error_type = if is_capacity { "capacity_error" } else { "rate_limit_error" };
+                tracing::warn!("Account {} {} for {} seconds", account.email, error_type, effective_seconds);
 
                 return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
                     "error": {
-                        "message": format!("Rate limited. Retry after {} seconds", seconds),
-                        "type": "rate_limit_error"
+                        "message": format!("Rate limited. Retry after {} seconds", effective_seconds),
+                        "type": error_type
                     }
                 }))).into_response();
             }
@@ -493,7 +502,7 @@ pub async fn messages(
 
     // Create Antigravity client with user's project ID from config
     let project_id = state.config.project_id.clone();
-    let client = match AntigravityClient::new(account.access_token.clone(), project_id.clone()) {
+    let client = match AntigravityClient::new(account.access_token.clone(), project_id.clone(), Some((*state.fingerprint).clone())) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to create Antigravity client: {}", e);
@@ -546,16 +555,27 @@ pub async fn messages(
             let error_str = e.to_string();
             tracing::warn!("Antigravity API Error: '{}'", error_str);
 
-            // Trigger fallback on Rate Limit (429), Forbidden (403 - Quota), or Overloaded (503)
+            // Trigger fallback on Rate Limit (429), Capacity (503/529), Forbidden (403 - Quota)
             if error_str.starts_with("RATE_LIMITED:")
+                || error_str.starts_with("CAPACITY_ERROR:")
                 || error_str.contains("429")
-                || error_str.contains("403")
                 || error_str.contains("503")
+                || error_str.contains("529")
             {
-                 // Parse retry duration
+                 // Parse retry duration from RATE_LIMITED:seconds:error or CAPACITY_ERROR:seconds:error
                  let parts: Vec<&str> = error_str.splitn(3, ':').collect();
                  let seconds = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
-                 let until = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
+                 
+                 // Use exponential backoff for capacity errors (base 45s with exponential increase)
+                 let is_capacity = error_str.starts_with("CAPACITY_ERROR:");
+                 let effective_seconds = if is_capacity {
+                     // For capacity errors, use longer initial backoff
+                     std::cmp::max(seconds, 45)
+                 } else {
+                     seconds
+                 };
+                 
+                 let until = chrono::Utc::now() + chrono::Duration::seconds(effective_seconds as i64);
 
                  // Mark CURRENT account as rate limited
                  state.account_manager.mark_rate_limited(account.index, until).await;
@@ -585,7 +605,7 @@ pub async fn messages(
                      tracing::info!("Strategy 2: Rotating account...");
                      if let Some(new_account) = state.account_manager.get_available_account().await {
                          tracing::info!("Switched to account: {}", new_account.email);
-                         if let Ok(new_client) = AntigravityClient::new(new_account.access_token.clone(), project_id.clone()) {
+                         if let Ok(new_client) = AntigravityClient::new(new_account.access_token.clone(), project_id.clone(), Some((*state.fingerprint).clone())) {
 
                              // Try Spoof immediately on new account
                              let target_model = if let Some(spoof) = get_spoof_model(model) { spoof } else { model };
@@ -658,20 +678,30 @@ pub async fn messages(
         Err(e) => {
             let error_str = e.to_string();
 
-            // Handle rate limiting
-            if error_str.starts_with("RATE_LIMITED:") {
+            // Handle rate limiting and capacity errors
+            if error_str.starts_with("RATE_LIMITED:") || error_str.starts_with("CAPACITY_ERROR:") {
                 let parts: Vec<&str> = error_str.splitn(3, ':').collect();
                 let seconds = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
-                let until = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
+                
+                // Use longer backoff for capacity errors
+                let is_capacity = error_str.starts_with("CAPACITY_ERROR:");
+                let effective_seconds = if is_capacity {
+                    std::cmp::max(seconds, 45)
+                } else {
+                    seconds
+                };
+                
+                let until = chrono::Utc::now() + chrono::Duration::seconds(effective_seconds as i64);
 
                 state.account_manager.mark_rate_limited(account.index, until).await;
-                tracing::warn!("Account {} rate limited for {} seconds", account.email, seconds);
+                let error_type = if is_capacity { "capacity_error" } else { "rate_limit_error" };
+                tracing::warn!("Account {} {} for {} seconds", account.email, error_type, effective_seconds);
 
                 return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
                     "type": "error",
                     "error": {
-                        "type": "rate_limit_error",
-                        "message": format!("Rate limited. Retry after {} seconds", seconds)
+                        "type": error_type,
+                        "message": format!("Rate limited. Retry after {} seconds", effective_seconds)
                     }
                 }))).into_response();
             }
@@ -827,6 +857,7 @@ async fn messages_streaming(
     // Clone state for async move
     let account_manager = state.account_manager.clone();
     let project_id = state.config.project_id.clone();
+    let fingerprint = state.fingerprint.clone();
 
     // Create the stream
     let stream = async_stream::stream! {
@@ -967,7 +998,7 @@ async fn messages_streaming(
 
 
         // 4. Create Client
-        let client = match AntigravityClient::new(account.access_token.clone(), project_id.clone()) {
+        let client = match AntigravityClient::new(account.access_token.clone(), project_id.clone(), Some((*fingerprint).clone())) {
             Ok(c) => c,
             Err(e) => {
                 let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
@@ -1162,11 +1193,20 @@ async fn messages_streaming(
                 let error_str = e.to_string();
                 tracing::warn!("Antigravity API Error: '{}'", error_str);
 
-                // Rate Limit Handling
-                if error_str.starts_with("RATE_LIMITED:") {
+                // Rate Limit & Capacity Error Handling
+                if error_str.starts_with("RATE_LIMITED:") || error_str.starts_with("CAPACITY_ERROR:") {
                      let parts: Vec<&str> = error_str.splitn(3, ':').collect();
                      let seconds = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(60);
-                     let until = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
+                     
+                     // Use longer backoff for capacity errors
+                     let is_capacity = error_str.starts_with("CAPACITY_ERROR:");
+                     let effective_seconds = if is_capacity {
+                         std::cmp::max(seconds, 45)
+                     } else {
+                         seconds
+                     };
+                     
+                     let until = chrono::Utc::now() + chrono::Duration::seconds(effective_seconds as i64);
                      account_manager.mark_rate_limited(account.index, until).await;
 
                      // Strategy 1: Spoofing Fallback
