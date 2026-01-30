@@ -605,37 +605,83 @@ pub async fn messages(
                      }
                  }
 
-                 if !spoof_success {
-                     // Strategy 2: Rotate Account (Absolute Fallback)
-                     tracing::info!("Strategy 2: Rotating account...");
-                     if let Some(new_account) = state.account_manager.get_available_account().await {
-                         tracing::info!("Switched to account: {}", new_account.email);
-                         if let Ok(new_client) = AntigravityClient::new(new_account.access_token.clone(), project_id.clone(), Some((*state.fingerprint).clone())) {
-
-                             // Try Spoof immediately on new account
-                             let target_model = if let Some(spoof) = get_spoof_model(model) { spoof } else { model };
-                             let target_config = if target_model != model {
-                                 adapt_config_for_spoof(&thinking_config, target_model)
-                             } else {
-                                 thinking_config.clone()
-                             };
-
-                              match new_client.chat_completion(target_model, messages, target_config, tools.clone()).await {
-                                  Ok(res) => {
-                                      // NOTE: Don't clear rate limit on original account
-                                      // The primary model is still rate-limited, we just used a fallback
-                                      final_res = Ok(res);
-                                  },
-                                  Err(e3) => {
-                                      tracing::error!("Strategy 2 Failed: {}", e3);
-                                      final_res = Err(e3);
+                  if !spoof_success {
+                      // Strategy 1.5: Dual Quota Fallback (Gemini CLI headers)
+                      // Only for Gemini models - try alternate quota pool before rotating accounts
+                      if model.is_gemini() {
+                          tracing::info!("Strategy 1.5: Attempting dual quota fallback with Gemini CLI headers...");
+                          
+                          // Create a new client with Gemini CLI headers
+                          let cli_client = match AntigravityClient::new(
+                              account.access_token.clone(), 
+                              project_id.clone(), 
+                              Some((*state.fingerprint).clone())
+                          ) {
+                              Ok(mut c) => {
+                                  // Enable dual quota mode
+                                  c.set_quota_fallback(true).await;
+                                  // Switch to Gemini CLI headers
+                                  if let Err(e) = c.switch_to_gemini_cli_headers().await {
+                                      tracing::warn!("Failed to switch to Gemini CLI headers: {}", e);
+                                      None
+                                  } else {
+                                      Some(c)
                                   }
                               }
-                         }
-                     } else {
-                         tracing::error!("No alternative accounts available.");
-                     }
-                 }
+                              Err(e) => {
+                                  tracing::warn!("Failed to create CLI client: {}", e);
+                                  None
+                              }
+                          };
+                          
+                          if let Some(ref cli_c) = cli_client {
+                              // Try the same model with Gemini CLI headers
+                              match cli_c.chat_completion(model, messages.clone(), thinking_config.clone(), tools.clone()).await {
+                                  Ok(res) => {
+                                      tracing::info!("Strategy 1.5 SUCCESS: Dual quota worked!");
+                                      spoof_success = true;
+                                      final_res = Ok(res);
+                                  }
+                                  Err(e2) => {
+                                      tracing::warn!("Strategy 1.5 Failed: {}", e2);
+                                      // Continue to Strategy 2
+                                  }
+                              }
+                          }
+                      }
+                  }
+
+                  if !spoof_success {
+                      // Strategy 2: Rotate Account (Absolute Fallback)
+                      tracing::info!("Strategy 2: Rotating account...");
+                      if let Some(new_account) = state.account_manager.get_available_account().await {
+                          tracing::info!("Switched to account: {}", new_account.email);
+                          if let Ok(new_client) = AntigravityClient::new(new_account.access_token.clone(), project_id.clone(), Some((*state.fingerprint).clone())) {
+
+                              // Try Spoof immediately on new account
+                              let target_model = if let Some(spoof) = get_spoof_model(model) { spoof } else { model };
+                              let target_config = if target_model != model {
+                                  adapt_config_for_spoof(&thinking_config, target_model)
+                              } else {
+                                  thinking_config.clone()
+                              };
+
+                               match new_client.chat_completion(target_model, messages, target_config, tools.clone()).await {
+                                   Ok(res) => {
+                                       // NOTE: Don't clear rate limit on original account
+                                       // The primary model is still rate-limited, we just used a fallback
+                                       final_res = Ok(res);
+                                   },
+                                   Err(e3) => {
+                                       tracing::error!("Strategy 2 Failed: {}", e3);
+                                       final_res = Err(e3);
+                                   }
+                               }
+                          }
+                      } else {
+                          tracing::error!("No alternative accounts available.");
+                      }
+                  }
                  final_res
             } else {
                 Err(e)

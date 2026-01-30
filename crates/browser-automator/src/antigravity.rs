@@ -140,6 +140,11 @@ impl AntigravityModel {
         )
     }
 
+    /// Whether this is a Gemini model
+    pub fn is_gemini(&self) -> bool {
+        matches!(self, Self::Gemini3Pro | Self::Gemini3Flash)
+    }
+
     /// Gets the default thinking budget for this model (if applicable)
     pub fn default_thinking_budget(&self) -> Option<u32> {
         match self {
