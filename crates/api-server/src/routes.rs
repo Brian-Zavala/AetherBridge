@@ -972,6 +972,8 @@ async fn messages_streaming(
         // 2. Start a "System Log" block to report status (as text so it's visible)
         let mut block_index = 0;
         let status_block_index = block_index;
+        // Track whether status block is still open - critical for preventing malformed SSE
+        let mut status_block_open = true;
 
         // Use a text block for status updates because 'thinking' blocks are often hidden/collapsed in UIs
         let block_start = serde_json::json!({
@@ -1109,6 +1111,8 @@ async fn messages_streaming(
         // Let's close it so the real answer is distinct.
         let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
         yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+        // Mark that status block is now closed - subsequent status messages need a new block
+        status_block_open = false;
         block_index += 1;
 
         // 5. Convert Messages & Config
@@ -1163,20 +1167,23 @@ async fn messages_streaming(
                  });
                  yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
 
-                 let mut inside_thought = false;
+                  let mut inside_thought = false;
+                  let mut has_tool_use = false; // Track if we encountered tool_use for stop_reason
 
-                 while let Some(chunk_res) = output_stream.next().await {
+                  while let Some(chunk_res) = output_stream.next().await {
                      match chunk_res {
                          Ok(chunk) => {
                              if chunk.done { break; }
 
-                             if chunk.is_tool_use {
-                                 // Close current text block if open
-                                 let block_stop = serde_json::json!({ "type": "content_block_stop", "index": text_index });
-                                 yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+                              if chunk.is_tool_use {
+                                  has_tool_use = true; // Mark that we have tool_use for stop_reason
+                                  
+                                  // Close current text block if open
+                                  let block_stop = serde_json::json!({ "type": "content_block_stop", "index": text_index });
+                                  yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
 
-                                 // Increment block index for tool use
-                                 text_index += 1; // Actually tool_index, but we reuse the variable for sequential indexing
+                                  // Increment block index for tool use
+                                  text_index += 1; // Actually tool_index, but we reuse the variable for sequential indexing
 
                                  // Parse tool use JSON
                                  if let Ok(mut tool_json) = serde_json::from_str::<Value>(&chunk.delta) {
@@ -1267,13 +1274,15 @@ async fn messages_streaming(
                  let block_stop = serde_json::json!({ "type": "content_block_stop", "index": text_index });
                  yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
 
-                 // Message Delta and Stop
-                 let message_delta = serde_json::json!({
-                    "type": "message_delta",
-                    "delta": { "stop_reason": "end_turn", "stop_sequence": null },
-                    "usage": { "output_tokens": 0 }
-                 });
-                 yield Ok(Event::default().event("message_delta").data(message_delta.to_string()));
+                  // Message Delta and Stop
+                  // Use correct stop_reason: "tool_use" if tools were called, "end_turn" otherwise
+                  let stop_reason = if has_tool_use { "tool_use" } else { "end_turn" };
+                  let message_delta = serde_json::json!({
+                     "type": "message_delta",
+                     "delta": { "stop_reason": stop_reason, "stop_sequence": null },
+                     "usage": { "output_tokens": 0 }
+                  });
+                  yield Ok(Event::default().event("message_delta").data(message_delta.to_string()));
 
                  let message_stop = serde_json::json!({ "type": "message_stop" });
                  yield Ok(Event::default().event("message_stop").data(message_stop.to_string()));
@@ -1298,34 +1307,50 @@ async fn messages_streaming(
                      let until = chrono::Utc::now() + chrono::Duration::seconds(effective_seconds as i64);
                      account_manager.mark_rate_limited(account.index, ModelFamily::from_model_id(&model.api_id().to_string()), until).await;
 
-                     // Strategy 1: Spoofing Fallback
-                     if let Some(spoof_model) = get_spoof_model(model) {
-                         let msg = format!("\n> Rate limit hit. Fallback Strategy 1: Spoofing {:?} on same account...\n", spoof_model);
-                         let delta = serde_json::json!({
-                              "type": "content_block_delta",
-                              "index": status_block_index,
-                              "delta": { "type": "text_delta", "text": msg }
-                         });
-                         yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+                      // Strategy 1: Spoofing Fallback
+                      if let Some(spoof_model) = get_spoof_model(model) {
+                          // Check if status block is still open - if not, start a new block for error messages
+                          if !status_block_open {
+                              // Start a new status block since the original is closed
+                              block_index += 1;
+                              let block_start = serde_json::json!({
+                                  "type": "content_block_start",
+                                  "index": block_index,
+                                  "content_block": { "type": "text", "text": "" }
+                              });
+                              yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
+                              status_block_open = true;
+                          }
+                          
+                          let msg = format!("\n> Rate limit hit. Fallback Strategy 1: Spoofing {:?} on same account...\n", spoof_model);
+                          let delta = serde_json::json!({
+                               "type": "content_block_delta",
+                               "index": if status_block_open { status_block_index } else { block_index },
+                               "delta": { "type": "text_delta", "text": msg }
+                          });
+                          yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
 
-                         // Adapt config and retry
-                         let spoof_config = adapt_config_for_spoof(&thinking_config, spoof_model);
-                          match client.chat_completion_stream(spoof_model, messages.clone(), spoof_config.clone(), tools.clone()).await {
-                              Ok(spoof_stream) => {
-                                  // SUCCESS: Reuse the stream handling logic
-                                  // We need to duplicate the stream handling loop here or refactor.
-                                  // For now, duplication is safer to avoid complex borrow checker issues with recursion/closures in async gen blocks.
+                          // Adapt config and retry
+                          let spoof_config = adapt_config_for_spoof(&thinking_config, spoof_model);
+                           match client.chat_completion_stream(spoof_model, messages.clone(), spoof_config.clone(), tools.clone()).await {
+                               Ok(spoof_stream) => {
+                                   // SUCCESS: Reuse the stream handling logic
+                                   // We need to duplicate the stream handling loop here or refactor.
+                                   // For now, duplication is safer to avoid complex borrow checker issues with recursion/closures in async gen blocks.
 
-                                  // NOTE: Don't clear rate limit - primary model is still rate-limited
-                                  // We successfully used a fallback, but the account should stay marked
-                                  // so next request knows to use Strategy 0 (pre-emptive spoofing)
-                                  use futures_util::StreamExt;
-                                 let output_stream = spoof_stream; // Move ownership
-                                 tokio::pin!(output_stream);
+                                   // NOTE: Don't clear rate limit - primary model is still rate-limited
+                                   // We successfully used a fallback, but the account should stay marked
+                                   // so next request knows to use Strategy 0 (pre-emptive spoofing)
+                                   use futures_util::StreamExt;
+                                  let output_stream = spoof_stream; // Move ownership
+                                  tokio::pin!(output_stream);
 
-                                 // Close status block
-                                 let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
-                                 yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+                                  // Close status block if it's still open
+                                  if status_block_open {
+                                      let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
+                                      yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+                                      status_block_open = false;
+                                  }
 
                                  // Start text block
                                  let mut text_index = block_index + 1; // Increment for new block
@@ -1336,19 +1361,23 @@ async fn messages_streaming(
                                  });
                                  yield Ok(Event::default().event("content_block_start").data(block_start.to_string()));
 
-                                 let mut inside_thought = false;
-                                 while let Some(chunk_res) = output_stream.next().await {
-                                     match chunk_res {
-                                         Ok(chunk) => {
-                                             if chunk.done { break; }
+                                  let mut inside_thought = false;
+                                  let mut has_tool_use = false; // Track if we encountered tool_use for stop_reason
+                                  
+                                  while let Some(chunk_res) = output_stream.next().await {
+                                      match chunk_res {
+                                          Ok(chunk) => {
+                                              if chunk.done { break; }
 
-                                             if chunk.is_tool_use {
-                                                  // Close current text block if open
-                                                  let block_stop = serde_json::json!({ "type": "content_block_stop", "index": text_index });
-                                                  yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+                                              if chunk.is_tool_use {
+                                                   has_tool_use = true; // Mark that we have tool_use for stop_reason
+                                                   
+                                                   // Close current text block if open
+                                                   let block_stop = serde_json::json!({ "type": "content_block_stop", "index": text_index });
+                                                   yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
 
-                                                  // Increment block index for tool use
-                                                  text_index += 1;
+                                                   // Increment block index for tool use
+                                                   text_index += 1;
 
                                                   // Parse tool use JSON
                                                   if let Ok(mut tool_json) = serde_json::from_str::<Value>(&chunk.delta) {
@@ -1421,37 +1450,45 @@ async fn messages_streaming(
                                          }
                                      }
                                  }
-                                 // Stream finished successfully
-                                 let block_stop = serde_json::json!({ "type": "content_block_stop", "index": text_index });
-                                 yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
-                                 let message_delta = serde_json::json!({
-                                    "type": "message_delta",
-                                    "delta": { "stop_reason": "end_turn", "stop_sequence": null },
-                                    "usage": { "output_tokens": 0 }
-                                 });
-                                 yield Ok(Event::default().event("message_delta").data(message_delta.to_string()));
-                                 let message_stop = serde_json::json!({ "type": "message_stop" });
-                                 yield Ok(Event::default().event("message_stop").data(message_stop.to_string()));
-                                 return; // Done
+                                  // Stream finished successfully
+                                  let block_stop = serde_json::json!({ "type": "content_block_stop", "index": text_index });
+                                  yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+                                  // Use correct stop_reason: "tool_use" if tools were called, "end_turn" otherwise
+                                  let stop_reason = if has_tool_use { "tool_use" } else { "end_turn" };
+                                  let message_delta = serde_json::json!({
+                                     "type": "message_delta",
+                                     "delta": { "stop_reason": stop_reason, "stop_sequence": null },
+                                     "usage": { "output_tokens": 0 }
+                                  });
+                                  yield Ok(Event::default().event("message_delta").data(message_delta.to_string()));
+                                  let message_stop = serde_json::json!({ "type": "message_stop" });
+                                  yield Ok(Event::default().event("message_stop").data(message_stop.to_string()));
+                                  return; // Done
                              },
-                             Err(e2) => {
-                                 tracing::error!("Spoofing attempt failed: {}", e2);
-                                 let msg = format!("> Spoofing failed: {}\n", e2);
-                                 let delta = serde_json::json!({
-                                      "type": "content_block_delta",
-                                      "index": status_block_index,
-                                      "delta": { "type": "text_delta", "text": msg }
-                                 });
-                                 yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
-                                 // Fall through to original error report
-                             }
-                         }
-                     }
-                }
+                              Err(e2) => {
+                                  tracing::error!("Spoofing attempt failed: {}", e2);
+                                  // Check if status block is still open before sending error message
+                                  if status_block_open {
+                                      let msg = format!("> Spoofing failed: {}\n", e2);
+                                      let delta = serde_json::json!({
+                                           "type": "content_block_delta",
+                                           "index": status_block_index,
+                                           "delta": { "type": "text_delta", "text": msg }
+                                      });
+                                      yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+                                  }
+                                  // Fall through to original error report
+                              }
+                          }
+                      }
+                 }
 
-                // Close status block before error
-                let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
-                yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+                 // Close status block before error (only if still open)
+                 if status_block_open {
+                     let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
+                     yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+                     status_block_open = false;
+                 }
 
                 // Emit original error
                  let error_event = serde_json::json!({
