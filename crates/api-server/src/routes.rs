@@ -1480,30 +1480,32 @@ async fn messages_streaming(
                                   let message_stop = serde_json::json!({ "type": "message_stop" });
                                   yield Ok(Event::default().event("message_stop").data(message_stop.to_string()));
                                   return; // Done
-                             },
+                              },
                               Err(e2) => {
                                   tracing::error!("Spoofing attempt failed: {}", e2);
-                                  // Check if status block is still open before sending error message
-                                  if status_block_open {
-                                      let msg = format!("> Spoofing failed: {}\n", e2);
-                                      let delta = serde_json::json!({
-                                           "type": "content_block_delta",
-                                           "index": status_block_index,
-                                           "delta": { "type": "text_delta", "text": msg }
-                                      });
-                                      yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
-                                  }
+                                  // Send error message to our active status block
+                                  let msg = format!("> Spoofing failed: {}\n", e2);
+                                  let delta = serde_json::json!({
+                                       "type": "content_block_delta",
+                                       "index": fallback_status_index,
+                                       "delta": { "type": "text_delta", "text": msg }
+                                  });
+                                  yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+                                  
+                                  // Close the fallback status block before falling through
+                                  let block_stop = serde_json::json!({ "type": "content_block_stop", "index": fallback_status_index });
+                                  yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+                                  
                                   // Fall through to original error report
                               }
                           }
                       }
-                 }
-
-                 // Close status block before error (only if still open)
-                 if status_block_open {
-                     let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
-                     yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
-                     // No need to set status_block_open = false here - we're about to return
+                 } else {
+                     // Only close original status block if we DIDN'T attempt fallback (and it's still open)
+                     if status_block_open {
+                         let block_stop = serde_json::json!({ "type": "content_block_stop", "index": status_block_index });
+                         yield Ok(Event::default().event("content_block_stop").data(block_stop.to_string()));
+                     }
                  }
 
                 // Emit original error
